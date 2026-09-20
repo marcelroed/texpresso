@@ -545,16 +545,16 @@ parse_line(const uint8_t *ptr, struct record *r)
 }
 
 struct candidate {
-  float area;
+  double area;
   fz_irect rect;
   struct link link;
   int len;
   const char *filename;
 };
 
-static float rect_area(fz_irect r)
+static double rect_area(fz_irect r)
 {
-  return (float)(r.y1 - r.y0) * (float)(r.x1 - r.x0);
+  return (double)(r.y1 - r.y0) * (double)(r.x1 - r.x0);
 }
 
 static int get_filename(synctex_t *stx, fz_buffer *buf, struct candidate *c, int tag)
@@ -585,11 +585,20 @@ static int get_filename(synctex_t *stx, fz_buffer *buf, struct candidate *c, int
   return len;
 }
 
+// Clicks between two typeset lines (or a little above/below a line) snap to
+// the nearest line box within this vertical distance, in sp (12pt).
+#define STX_GAP_TOLERANCE (12 * 65536)
+// Vertical distance dominates the score: a line box a few points away beats
+// any horizontally-nearer node on a farther line.
+#define STX_DY_WEIGHT 1e14
+// Vertical boxes are only a fallback when no line box or inner node matches.
+#define STX_VBOX_PENALTY 1e20
+
 static void
 parse_tree(synctex_t *stx, fz_buffer *buf, const uint8_t *ptr, int x, int y, struct candidate *c)
 {
   int nest = 0;
-  struct size saved[256];
+  struct { enum kind kind; struct size size; int dy; } saved[256];
 
   struct record r = {0,};
   while ((ptr = parse_line(ptr, &r)))
@@ -605,51 +614,88 @@ parse_tree(synctex_t *stx, fz_buffer *buf, const uint8_t *ptr, int x, int y, str
       case STEX_KERN:
       case STEX_GLUE:
       case STEX_MATH:
-        if (rect.y0 <= y && y <= rect.y1)
+      {
+        // Kern, glue, math and "current" records carry no vertical extent of
+        // their own, so they would only ever match a click exactly on the
+        // baseline. Inherit the height and depth of the innermost enclosing
+        // horizontal box (the typeset line) instead, as the reference SyncTeX
+        // parser does. Otherwise the enclosing box always wins, and its line
+        // number is where the paragraph was packed (the line after the
+        // paragraph), not the source line of the material under the cursor.
+        int dy = 0;
+        if (nest > 0 && nest <= 256 && saved[nest - 1].kind == STEX_ENTER_H)
         {
-          if (rect.x0 < x)
-            rect.x1 = x;
-          else
-          {
-            rect.x1 = rect.x0;
-            rect.x0 = x;
-          }
-          float area = rect_area(rect);
-          // fprintf(stderr, "synctex pre-candidate area:%.2f (current:%.2f)\n", area, c->area);
-          if (area < c->area && get_filename(stx, buf, c, r.link.tag))
-          {
-            // fprintf(stderr, "synctex candidate\n");
-            c->area = area;
-            c->rect = rect;
-            c->link = r.link;
-          }
+          rect.y0 = r.point.y - saved[nest - 1].size.height;
+          rect.y1 = r.point.y + saved[nest - 1].size.depth;
+          dy = saved[nest - 1].dy;
+        }
+        else if (!(rect.y0 <= y && y <= rect.y1))
+          break;
+
+        if (rect.x0 < x)
+          rect.x1 = x;
+        else
+        {
+          rect.x1 = rect.x0;
+          rect.x0 = x;
+        }
+        double score = dy * STX_DY_WEIGHT + rect_area(rect);
+        if (score < c->area && get_filename(stx, buf, c, r.link.tag))
+        {
+          c->area = score;
+          c->rect = rect;
+          c->link = r.link;
         }
         break;
+      }
       case STEX_ENTER_H:
       case STEX_ENTER_V:
-        if (fz_is_point_inside_irect(x, y, rect))
+      {
+        int dy = 0;
+        _Bool inside;
+        double score;
+        if (r.kind == STEX_ENTER_H)
         {
-          // fprintf(stderr, "synctex pre-candidate\n");
-          float area = rect_area(rect);
-          if (area < c->area && get_filename(stx, buf, c, r.link.tag))
+          // A horizontal box is a typeset line: accept clicks slightly above
+          // or below it, so that clicking in the gap between two lines picks
+          // the nearest line instead of falling through to the page box.
+          if (y < rect.y0)
+            dy = rect.y0 - y;
+          else if (y > rect.y1)
+            dy = y - rect.y1;
+          inside = rect.x0 <= x && x < rect.x1 && dy <= STX_GAP_TOLERANCE;
+          score = dy * STX_DY_WEIGHT + rect_area(rect);
+        }
+        else
+        {
+          inside = fz_is_point_inside_irect(x, y, rect);
+          score = STX_VBOX_PENALTY + rect_area(rect);
+        }
+        if (inside)
+        {
+          if (score < c->area && get_filename(stx, buf, c, r.link.tag))
           {
-            // fprintf(stderr, "synctex candidate\n");
-            c->area = area;
+            c->area = score;
             c->rect = rect;
             c->link = r.link;
           }
-          saved[nest] = r.size;
+          if (nest < 256)
+          {
+            saved[nest].kind = r.kind;
+            saved[nest].size = r.size;
+            saved[nest].dy = dy;
+          }
           nest += 1;
         }
         else
           ptr = skip_record(ptr, &r);
         break;
+      }
       case STEX_LEAVE_H:
       case STEX_LEAVE_V:
         nest -= 1;
         if (nest < 0)
           return;
-        r.size = saved[nest];
       case STEX_OTHER:
         continue;
     }
@@ -799,6 +845,14 @@ synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page,
 
   int had_record = 0;
 
+  // First record on this page whose line is past the target, if any.
+  // Material from later source lines can precede the target on a page: an
+  // enclosing box packed later (a tabular, a minipage, a float) is recorded
+  // before its content. So seeing such a record does not end the search;
+  // the rest of the page is still scanned for a closer record.
+  struct record past = {0,};
+  int past_seen = 0;
+
   while ((ptr = parse_line(ptr, &r)))
   {
     // Remember the first location of the page to skip it:
@@ -828,36 +882,63 @@ synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page,
       had_record = 1;
 
       // Remember that we have seen at least one record
-      // Check if candidate
-      if (r.link.line <= line || (r.link.line > line && stx->candidate_page == -1))
+      // Check if candidate: the closest record at or before the target line.
+      // On a new page any such record supersedes an older candidate; within a
+      // page, a record only supersedes one that is not closer to the target.
+      if (r.link.line <= line)
       {
-        stx->candidate_page = page;
-        stx->candidate_x = r.point.x;
-        stx->candidate_y = r.point.y;
-        stx->candidate_line = r.link.line;
-        *updated_candidate = 1;
-      }
-
-      // Check if definitive match
-      if (r.link.line >= line)
-      {
-        if (stx->candidate_page != page)
+        if (stx->candidate_page != page || r.link.line >= stx->candidate_line)
         {
-          // The beginning and ending of the match crosses two (or more?) pages.
-          // Use current page to decide which one to keep.
-          if (stx->target_current_page == page)
-          {
-            stx->candidate_page = page;
-            stx->candidate_x = r.point.x;
-            stx->candidate_y = r.point.y;
-            stx->candidate_line = r.link.line;
-            *updated_candidate = 1;
-          }
+          stx->candidate_page = page;
+          stx->candidate_x = r.point.x;
+          stx->candidate_y = r.point.y;
+          stx->candidate_line = r.link.line;
+          *updated_candidate = 1;
         }
-        synctex_clear_search(stx);
-        return;
+        // An exact match is definitive.
+        if (r.link.line == line)
+        {
+          past = r;
+          past_seen = 1;
+          break;
+        }
+      }
+      else
+      {
+        if (stx->candidate_page == -1)
+        {
+          stx->candidate_page = page;
+          stx->candidate_x = r.point.x;
+          stx->candidate_y = r.point.y;
+          stx->candidate_line = r.link.line;
+          *updated_candidate = 1;
+        }
+        if (!past_seen || r.link.line < past.link.line)
+          past = r;
+        past_seen = 1;
       }
     }
+  }
+
+  // Definitive match: the target line, or a line past it, was seen on this
+  // page, so later pages cannot hold a closer record.
+  if (past_seen)
+  {
+    if (stx->candidate_page != page)
+    {
+      // The beginning and ending of the match crosses two (or more?) pages.
+      // Use current page to decide which one to keep.
+      if (stx->target_current_page == page)
+      {
+        stx->candidate_page = page;
+        stx->candidate_x = past.point.x;
+        stx->candidate_y = past.point.y;
+        stx->candidate_line = past.link.line;
+        *updated_candidate = 1;
+      }
+    }
+    synctex_clear_search(stx);
+    return;
   }
 
   // No record? Could be an empty page or a beamer page.
