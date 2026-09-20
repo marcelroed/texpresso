@@ -281,6 +281,19 @@ static void add(struct table *table,
     return;
   }
 
+  // Files under doc/ and source/ are never inputs for kpathsea (its search
+  // paths only cover tex/, fonts/, bibtex/, ...). Sample configuration files
+  // that ship with documentation (e.g. doc/generic/pgf/color.cfg or
+  // doc/latex/listings-ext/hyperref.cfg) would otherwise shadow, or stand in
+  // for, the real ones.
+  if (has_component(dir, "doc") || has_component(dir, "source"))
+  {
+    if (LOG)
+      fprintf(stderr, "add: skipping %s/%s/%s\n  (doc or source tree)\n",
+              root, dir, name);
+    return;
+  }
+
   struct cell *c = lookup(table, name);
   if (c->offset != 0)
   {
