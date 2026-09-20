@@ -328,6 +328,10 @@ static void ui_mouse_move(fz_context *ctx, ui_state *ui, int x, int y)
   }
 }
 
+// Document units panned per wheel unit. macOS trackpads and mice report
+// small precise deltas, so this needs to be fairly large to feel responsive.
+#define WHEEL_PAN_SPEED 25
+
 static void ui_mouse_wheel(fz_context *ctx, ui_state *ui, float dx, float dy, int mousex, int mousey, bool ctrl, int timestamp)
 {
   fz_point scale = get_scale_factor(ui->window);
@@ -357,8 +361,8 @@ static void ui_mouse_wheel(fz_context *ctx, ui_state *ui, float dx, float dy, in
   else
   {
     (void)timestamp;
-    float x = scale.x * dx * 5;
-    float y = scale.y * dy * 5;
+    float x = scale.x * dx * WHEEL_PAN_SPEED;
+    float y = scale.y * dy * WHEEL_PAN_SPEED;
     config->pan.x -= x;
     config->pan.y += y;
     // fprintf(stderr, "wheel pan: (%.02f, %.02f) raw:(%.02f, %.02f)\n", x, y, dx, dy);
@@ -1601,12 +1605,7 @@ bool texpresso_main(struct persistent_state *ps)
         {
            int mx = 0, my = 0;
            float px = 0, py = 0;
-#if SDL_VERSION_ATLEAST(2, 0, 260)
-           mx = e.wheel.mouseX;
-           my = e.wheel.mouseY;
-#else
-           SDL_GetMouseState(&mx, &my);
-#endif
+           mouse_position_in_points(&mx, &my);
 #if SDL_VERSION_ATLEAST(2, 0, 18)
           px = e.wheel.preciseX;
           py = e.wheel.preciseY;
