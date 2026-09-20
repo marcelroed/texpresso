@@ -330,7 +330,7 @@ static void ui_mouse_move(fz_context *ctx, ui_state *ui, int x, int y)
 
 // Document units panned per wheel unit. macOS trackpads and mice report
 // small precise deltas, so this needs to be fairly large to feel responsive.
-#define WHEEL_PAN_SPEED 25
+#define WHEEL_PAN_SPEED 20
 
 static void ui_mouse_wheel(fz_context *ctx, ui_state *ui, float dx, float dy, int mousex, int mousey, bool ctrl, int timestamp)
 {
