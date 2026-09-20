@@ -56,6 +56,10 @@ typedef struct
   int pid, fd;
   int trace_len;
   mark_t snap;
+  // Set when the driver killed the process (stuck-worker heuristic). Such a
+  // process produced no usable state past its trace, so a rollback must drop
+  // it rather than keep it as a (dead) resume point.
+  bool killed;
 } process_t;
 
 enum
@@ -211,6 +215,7 @@ static void prepare_process(fz_context *ctx, struct tex_engine *self)
     process_t *p = get_process(self);
     p->pid = exec_xelatex(self->engine_path, self->use_texlive, self->name, &p->fd);
     p->trace_len = 0;
+    p->killed = false;
     if (!channel_handshake(self->c, p->fd))
       mabort();
   }
@@ -963,6 +968,7 @@ static void answer_query(fz_context *ctx, struct tex_engine *self, query_t *q)
       p2->fd = q->chld.fd;
       p2->pid = q->chld.pid;
       p2->trace_len = p->trace_len;
+      p2->killed = false;
       a.tag = A_DONE;
       channel_write_answer(self->c, p->fd, &a);
       break;
@@ -1020,6 +1026,24 @@ static void rollback_processes(fz_context *ctx, struct tex_engine *self, int rev
 
   while (self->process_count > 0 && get_process(self)->trace_len > trace)
     pop_process(ctx, self);
+
+  // A dead process at the top of the stack is only a valid resume point if it
+  // terminated by itself after producing output. One that the driver killed
+  // (stuck-worker heuristic), or that died before tracing any read (e.g. an
+  // edit arrived while a fresh process was still loading its format), can
+  // never make progress again: engine_step would only respawn with an empty
+  // stack, so the document would stay frozen until a manual restart. Drop such
+  // processes so the next step resumes from the previous snapshot, or starts
+  // over.
+  while (self->process_count > 0 && get_process(self)->fd == -1 &&
+         (get_process(self)->killed || get_process(self)->trace_len == 0))
+  {
+    fprintf(stderr, "[rollback] dropping dead process (pid %d, %s, %d trace entries)\n",
+            get_process(self)->pid,
+            get_process(self)->killed ? "killed" : "exited",
+            get_process(self)->trace_len);
+    pop_process(ctx, self);
+  }
 
   int trace_len = self->process_count == 0 ? 0 : get_process(self)->trace_len;
   while (reverted > trace_len)
@@ -1328,6 +1352,14 @@ static bool process_pending_messages(fz_context *ctx, struct tex_engine *self)
   if (p->fd == -1)
     return 1;
 
+  // A process that has not opened any file yet cannot have observed stale
+  // contents, so there is nothing to synchronize. Don't apply the stuck-worker
+  // heuristic to it either: a freshly launched engine is silent for tens of
+  // milliseconds while it loads its format, and killing it would only throw
+  // that work away (typing right after a finishing-pass relaunch hits this).
+  if (p->trace_len == 0)
+    return 0;
+
   // Synchronize with the child process:
   // - kill if stuck
   // - check pending SEEN messages to update vision of the process
@@ -1339,6 +1371,7 @@ static bool process_pending_messages(fz_context *ctx, struct tex_engine *self)
       // The process hasn't answered in 10ms
       // It might be stuck in long computation or a loop, kill it to start from the previous one.
       close_process(p);
+      p->killed = true;
       break;
     }
     // Process only pending SEEN to have an updated view on process state

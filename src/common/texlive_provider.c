@@ -216,7 +216,8 @@ static bool rank(const char *existing, const char *root, const char *dir)
   // If 'root' is not fully matched or 'existing' does not continue with '/', they are not comparable
   if (*root || *existing != '/')
   {
-    fprintf(stderr, "rank: root differ, skipping\n");
+    if (LOG)
+      fprintf(stderr, "rank: root differ, skipping\n");
     return 0;
   }
   existing++; // Skip the '/' after common root
@@ -238,12 +239,14 @@ static bool rank(const char *existing, const char *root, const char *dir)
   // Use rank_component to determine priority between the two.
   if (rank_component(eslash, dslash))
   {
-    fprintf(stderr, "%s has priority over %s\n", dslash, eslash);
+    if (LOG)
+      fprintf(stderr, "%s has priority over %s\n", dslash, eslash);
     return 1;
   }
   else
   {
-    fprintf(stderr, "%s does not have priority over %s\n", dslash, eslash);
+    if (LOG)
+      fprintf(stderr, "%s does not have priority over %s\n", dslash, eslash);
     return 0;
   }
 }
