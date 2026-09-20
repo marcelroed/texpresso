@@ -56,7 +56,7 @@ re2c:define:YYSHIFTSTAG = "@@{tag} += @@{shift};";
 
 nat     = [0-9]+;
 int     = "-"? nat;
-float   = int ("." nat*)?;
+float   = int ("." nat*)? | "-"? "." nat+;
 ws      = " ";
 rawunit = ("pt" | "mm" | "cm" | "in");
 unit    = "true"? rawunit;
