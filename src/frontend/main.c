@@ -229,6 +229,16 @@ static fz_point get_scale_factor(SDL_Window *window)
 
 /* UI events */
 
+// Mouse event coordinates are window points with SDL2 proper, but sdl2-compat
+// (the SDL2 API implemented over SDL3) converts them to renderer coordinates,
+// which are pixels on high-DPI displays. Scaling those by the pixel density
+// again put every click at twice its distance from the window origin.
+// SDL_GetMouseState reports points in both cases, so take the position from it.
+static void mouse_position_in_points(int *x, int *y)
+{
+  SDL_GetMouseState(x, y);
+}
+
 static void ui_mouse_down(struct persistent_state *ps, ui_state *ui, int x, int y, bool ctrl)
 {
   if (ctrl)
@@ -1610,17 +1620,24 @@ bool texpresso_main(struct persistent_state *ps)
         break;
 
       case SDL_MOUSEBUTTONDOWN:
-        ui_mouse_down(ps, ui, e.button.x, e.button.y,
-                      SDL_GetModState() & KMOD_CTRL);
+      {
+        int mx, my;
+        mouse_position_in_points(&mx, &my);
+        ui_mouse_down(ps, ui, mx, my, SDL_GetModState() & KMOD_CTRL);
         break;
+      }
 
       case SDL_MOUSEBUTTONUP:
         ui_mouse_up(ui);
         break;
 
       case SDL_MOUSEMOTION:
-        ui_mouse_move(ps->ctx, ui, e.motion.x, e.motion.y);
+      {
+        int mx, my;
+        mouse_position_in_points(&mx, &my);
+        ui_mouse_move(ps->ctx, ui, mx, my);
         break;
+      }
 
       case SDL_WINDOWEVENT:
         switch (e.window.event)
