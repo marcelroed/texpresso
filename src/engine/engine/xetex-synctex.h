@@ -121,5 +121,6 @@ void synctex_pdfrefxform(int objnum);
 
 /*  For debugging purpose only    */
 void synctex_current(void);
+int32_t synctex_line_and_column(void);
 
 #  endif

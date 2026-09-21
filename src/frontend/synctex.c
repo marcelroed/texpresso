@@ -24,6 +24,7 @@
 
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 #include "synctex.h"
 #include "editor.h"
 #include "myabort.h"
@@ -116,6 +117,9 @@ static void ib_append(fz_context *ctx, struct int_buffer *ib, int offset)
   ib->len += 1;
 }
 
+// Set TEXPRESSO_SYNCTEX_DEBUG in the environment to trace forward search.
+static int synctex_debug = -1;
+
 struct synctex_s
 {
   struct int_buffer input_off, page_off, close_off, close_inp;
@@ -129,6 +133,11 @@ struct synctex_s
      search going on. */
   char target_path[1024];
   int target_line;
+  /* Column within target_line (0-based, number of characters before the
+     cursor), or -1 when the editor did not provide one. Records carry the
+     column of the input reader when TeXpresso's engine wrote them; the
+     candidate is then refined to the record closest to the target column. */
+  int target_column;
 
   /* The page that was being displayed when the search started.
      The heuristics uses it to pick the match closest to the current page when
@@ -153,10 +162,15 @@ struct synctex_s
 
   /* Best candidate so far (or candidate_page == -1 if there has been no match). */
   int candidate_page, candidate_line, candidate_x, candidate_y;
+  /* The typeset line (innermost horizontal box) holding the candidate, in
+     synctex units, or an empty rectangle when unknown. */
+  fz_irect candidate_box;
 };
 
 synctex_t *synctex_new(fz_context *ctx)
 {
+  if (synctex_debug < 0)
+    synctex_debug = getenv("TEXPRESSO_SYNCTEX_DEBUG") != NULL;
   synctex_t *stx = fz_malloc_struct(ctx, synctex_t);
   ib_init(&stx->input_off);
   ib_init(&stx->page_off);
@@ -756,7 +770,7 @@ void synctex_scan(fz_context *ctx,
   }
 }
 
-void synctex_set_target(synctex_t *stx, int current_page, const char *path, int line)
+void synctex_set_target(synctex_t *stx, int current_page, const char *path, int line, int column)
 {
   if (!stx)
     return;
@@ -777,6 +791,7 @@ void synctex_set_target(synctex_t *stx, int current_page, const char *path, int 
   memcpy(stx->target_path, path, length);
   stx->target_path[length] = 0;
   stx->target_line = line;
+  stx->target_column = column;
   stx->target_current_page = current_page;
 
   stx->input_tag = 0;
@@ -833,6 +848,128 @@ static void synctex_clear_search(synctex_t *stx)
   stx->target_path[0] = 0;
 }
 
+// The innermost horizontal box enclosing a record, as a rectangle in synctex
+// units. Records inside vertical boxes only (or outside any box) get an empty
+// rectangle.
+struct box_stack {
+  struct { enum kind kind; fz_irect rect; } items[256];
+  int nest;
+};
+
+static void box_stack_enter(struct box_stack *bs, const struct record *r)
+{
+  if (bs->nest < 256)
+  {
+    bs->items[bs->nest].kind = r->kind;
+    bs->items[bs->nest].rect.x0 = r->point.x;
+    bs->items[bs->nest].rect.x1 = r->point.x + r->size.width;
+    bs->items[bs->nest].rect.y0 = r->point.y - r->size.height;
+    bs->items[bs->nest].rect.y1 = r->point.y + r->size.depth;
+  }
+  bs->nest += 1;
+}
+
+static void box_stack_leave(struct box_stack *bs)
+{
+  if (bs->nest > 0)
+    bs->nest -= 1;
+}
+
+static fz_irect box_stack_line(const struct box_stack *bs)
+{
+  for (int i = (bs->nest < 256 ? bs->nest : 256) - 1; i >= 0; i--)
+    if (bs->items[i].kind == STEX_ENTER_H)
+      return bs->items[i].rect;
+  return fz_empty_irect;
+}
+
+static void set_candidate(synctex_t *stx, int page, const struct record *r, fz_irect box, int *updated)
+{
+  stx->candidate_page = page;
+  stx->candidate_x = r->point.x;
+  stx->candidate_y = r->point.y;
+  stx->candidate_line = r->link.line;
+  stx->candidate_box = box;
+  *updated = 1;
+}
+
+// Refinement of an exact line match using the column information TeXpresso's
+// engine stores in each record (the position of the input reader when the
+// node was created). `best` is the first record whose column does not exceed
+// the target column, `next` the first later record with a larger column, and
+// `best_end` the last "current point" record between the two: those are
+// emitted at the end of each run of characters and carry the (stale) column
+// of the node before the run, so they only ever mark where the run that
+// started at `best` ends. The target position is interpolated between best
+// and the end of its run, proportionally to the column distance.
+struct column_match {
+  struct record best, best_end, next;
+  fz_irect best_box;
+  int has_best, has_best_end, has_next;
+};
+
+static void column_match_feed(struct column_match *cm, const struct record *r, fz_irect box, int target_column)
+{
+  if (r->link.column < 0)
+    return;
+  if (r->kind == STEX_CURRENT)
+  {
+    if (cm->has_best && !cm->has_next)
+    {
+      cm->best_end = *r;
+      cm->has_best_end = 1;
+    }
+    return;
+  }
+  if (r->link.column <= target_column)
+  {
+    if (!cm->has_best || r->link.column > cm->best.link.column)
+    {
+      cm->best = *r;
+      cm->best_box = box;
+      cm->has_best = 1;
+      cm->has_best_end = 0;
+      cm->has_next = 0;
+    }
+  }
+  else if (cm->has_best && !cm->has_next)
+  {
+    cm->next = *r;
+    cm->has_next = 1;
+  }
+}
+
+static struct record column_match_result(const struct column_match *cm, int target_column)
+{
+  struct record r = cm->best;
+  int c0 = cm->best.link.column;
+  if (target_column <= c0)
+    return r;
+
+  // Only interpolate along one baseline: a run that was hyphenated across
+  // typeset lines would otherwise place the mark in the void between them.
+  int end_x = -1;
+  if (cm->has_best_end && cm->best_end.point.y == r.point.y)
+    end_x = cm->best_end.point.x;
+  else if (cm->has_next && cm->next.point.y == r.point.y)
+    end_x = cm->next.point.x;
+
+  if (end_x < r.point.x)
+    return r;
+
+  if (cm->has_next && cm->next.link.column > c0)
+  {
+    double t = (double)(target_column - c0) / (cm->next.link.column - c0);
+    if (t > 1.0) t = 1.0;
+    r.point.x = r.point.x + (int)((end_x - r.point.x) * t);
+  }
+  else if (target_column > c0 + 1)
+    // Nothing recorded after the run (end of paragraph): the cursor is
+    // somewhere in or after the last word, show its end.
+    r.point.x = end_x;
+  return r;
+}
+
 static void
 synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page, int *updated_candidate)
 {
@@ -845,16 +982,34 @@ synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page,
 
   int had_record = 0;
 
+  struct box_stack boxes = {.nest = 0};
+
   // First record on this page whose line is past the target, if any.
   // Material from later source lines can precede the target on a page: an
   // enclosing box packed later (a tabular, a minipage, a float) is recorded
   // before its content. So seeing such a record does not end the search;
   // the rest of the page is still scanned for a closer record.
   struct record past = {0,};
+  fz_irect past_box = fz_empty_irect;
   int past_seen = 0;
+
+  // Records on the target line itself, when refining by column.
+  struct column_match cm = {.has_best = 0};
+  int use_column = stx->target_column >= 0;
+  int exact_seen = 0;
+  // Last one-line record before the first record of the target line: when
+  // it sits on the same baseline, it marks where the material of the target
+  // line starts (the source line began mid-paragraph).
+  struct record prev = {0,};
+  int has_prev = 0;
 
   while ((ptr = parse_line(ptr, &r)))
   {
+    if (r.kind == STEX_ENTER_H || r.kind == STEX_ENTER_V)
+      box_stack_enter(&boxes, &r);
+    else if (r.kind == STEX_LEAVE_H || r.kind == STEX_LEAVE_V)
+      box_stack_leave(&boxes);
+
     // Remember the first location of the page to skip it:
     // it is the location where the shipout procedure was invoked
     // not the location of actual source contents
@@ -871,6 +1026,13 @@ synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page,
       continue;
     }
 
+    if (is_oneliner(r.kind) && !exact_seen &&
+        !(r.link.tag == tag && r.link.line == line))
+    {
+      prev = r;
+      has_prev = 1;
+    }
+
     if (is_oneliner(r.kind) && r.link.tag == tag)
     {
       if (r.link.tag == r0.link.tag && r.link.line == r0.link.line)
@@ -881,61 +1043,91 @@ synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page,
       // Remember we processed at least one record
       had_record = 1;
 
+      fz_irect box = box_stack_line(&boxes);
+
       // Remember that we have seen at least one record
       // Check if candidate: the closest record at or before the target line.
       // On a new page any such record supersedes an older candidate; within a
       // page, a record only supersedes one that is not closer to the target.
       if (r.link.line <= line)
       {
-        if (stx->candidate_page != page || r.link.line >= stx->candidate_line)
-        {
-          stx->candidate_page = page;
-          stx->candidate_x = r.point.x;
-          stx->candidate_y = r.point.y;
-          stx->candidate_line = r.link.line;
-          *updated_candidate = 1;
-        }
-        // An exact match is definitive.
         if (r.link.line == line)
         {
-          past = r;
-          past_seen = 1;
+          // An exact match is definitive. With column information, keep
+          // scanning the page for the record nearest to the target column.
+          if (!exact_seen)
+          {
+            exact_seen = 1;
+            past = r;
+            past_box = box;
+            past_seen = 1;
+            if (use_column && r.link.column > 0)
+            {
+              // Synthetic record for column 0: the end of the preceding
+              // material on this baseline, or the left edge of the line box
+              // (a paragraph start, give or take the indentation).
+              struct record start = r;
+              start.kind = STEX_GLUE;
+              start.link.column = 0;
+              if (has_prev && prev.point.y == r.point.y && prev.point.x < r.point.x)
+                start.point.x = prev.point.x;
+              else if (!fz_is_empty_irect(box) && box.x0 < r.point.x)
+                start.point.x = box.x0;
+              else
+                start.kind = STEX_OTHER;
+              if (start.kind == STEX_GLUE)
+                column_match_feed(&cm, &start, box, stx->target_column);
+            }
+          }
+          if (use_column)
+          {
+            if (synctex_debug)
+              fprintf(stderr, "[synctex forward] line %d record kind %d column %d at (%d, %d)\n",
+                      r.link.line, r.kind, r.link.column, r.point.x, r.point.y);
+            column_match_feed(&cm, &r, box, stx->target_column);
+            continue;
+          }
           break;
         }
+        if (stx->candidate_page != page || r.link.line >= stx->candidate_line)
+          set_candidate(stx, page, &r, box, updated_candidate);
       }
       else
       {
         if (stx->candidate_page == -1)
-        {
-          stx->candidate_page = page;
-          stx->candidate_x = r.point.x;
-          stx->candidate_y = r.point.y;
-          stx->candidate_line = r.link.line;
-          *updated_candidate = 1;
-        }
+          set_candidate(stx, page, &r, box, updated_candidate);
         if (!past_seen || r.link.line < past.link.line)
+        {
           past = r;
+          past_box = box;
+        }
         past_seen = 1;
       }
     }
+  }
+
+  if (exact_seen && cm.has_best)
+  {
+    past = column_match_result(&cm, stx->target_column);
+    past_box = cm.best_box;
   }
 
   // Definitive match: the target line, or a line past it, was seen on this
   // page, so later pages cannot hold a closer record.
   if (past_seen)
   {
-    if (stx->candidate_page != page)
+    if (exact_seen)
+    {
+      // The (refined) position on the target line supersedes whatever earlier
+      // line was recorded as a candidate, on this page or a previous one.
+      set_candidate(stx, page, &past, past_box, updated_candidate);
+    }
+    else if (stx->candidate_page != page)
     {
       // The beginning and ending of the match crosses two (or more?) pages.
       // Use current page to decide which one to keep.
       if (stx->target_current_page == page)
-      {
-        stx->candidate_page = page;
-        stx->candidate_x = past.point.x;
-        stx->candidate_y = past.point.y;
-        stx->candidate_line = past.link.line;
-        *updated_candidate = 1;
-      }
+        set_candidate(stx, page, &past, past_box, updated_candidate);
     }
     synctex_clear_search(stx);
     return;
@@ -950,24 +1142,12 @@ synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page,
       // If we had no candidate, or the current record is not worse, update.
       if (stx->candidate_page == -1 ||
           (page <= stx->target_current_page && stx->candidate_line == r0.link.line))
-      {
-        stx->candidate_page = page;
-        stx->candidate_x = r0.point.x;
-        stx->candidate_y = r0.point.y;
-        stx->candidate_line = r0.link.line;
-        *updated_candidate = 1;
-      }
+        set_candidate(stx, page, &r0, fz_empty_irect, updated_candidate);
     }
-    // We have a candidate and future candidates cannot improve or we are past
-    // the current page, consider it a match.
-    // if (stx->candidate_page != -1 &&
-    //     ((r0.link.tag == tag && r0.link.line > stx->candidate_line) ||
-    //      (page >= stx->target_current_page)))
-    //   synctex_clear_search(stx);
   }
 }
 
-int synctex_find_target(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int *page, int *x, int *y)
+int synctex_find_target(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int *page, int *x, int *y, fz_irect *box)
 {
   if (!stx || !stx->target_path[0])
     return 0;
@@ -988,6 +1168,7 @@ int synctex_find_target(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int *pa
     if (page) *page = stx->candidate_page;
     if (x) *x = stx->candidate_x;
     if (y) *y = stx->candidate_y;
+    if (box) *box = stx->candidate_box;
   }
 
   if (synctex_input_closed(ctx, stx, stx->input_tag))

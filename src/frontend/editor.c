@@ -254,18 +254,27 @@ bool editor_parse(fz_context *ctx,
   }
   else if (strcmp(verb, "synctex-forward") == 0)
   {
-    if (len != 3)
+    if (len != 3 && len != 4)
       goto arity;
     val path = val_array_get(ctx, stack, command, 1);
     val line = val_array_get(ctx, stack, command, 2);
     if (!val_is_string(path) || !val_is_number(line))
       goto arguments;
+    int column = -1;
+    if (len == 4)
+    {
+      val col = val_array_get(ctx, stack, command, 3);
+      if (!val_is_number(col))
+        goto arguments;
+      column = val_number(ctx, col);
+    }
     *out = (struct editor_command){
         .tag = EDIT_SYNCTEX_FORWARD,
         .synctex_forward =
             {
                 .path = val_string(ctx, stack, path),
                 .line = val_number(ctx, line),
+                .column = column,
             },
     };
   }

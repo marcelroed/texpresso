@@ -114,7 +114,32 @@ typedef struct {
   uint32_t last_click_ticks;
   enum ui_mouse_status mouse_status;
   bool advancing;
+
+  // Forward sync marker: briefly highlights the position that the editor
+  // cursor maps to. Coordinates are in document space (points).
+  struct {
+    bool active;
+    int page;
+    fz_point pt;
+    fz_rect box; // typeset line holding pt, empty if unknown
+    uint32_t ticks, last_frame;
+  } sync_mark;
 } ui_state;
+
+// The marker is shown at full strength for SYNC_MARK_HOLD_MS, then fades
+// out over SYNC_MARK_FADE_MS.
+#define SYNC_MARK_HOLD_MS 700
+#define SYNC_MARK_FADE_MS 900
+#define SYNC_MARK_FRAME_MS 25
+
+static bool sync_mark_active(ui_state *ui)
+{
+  if (!ui->sync_mark.active)
+    return false;
+  if (SDL_GetTicks() - ui->sync_mark.ticks > SYNC_MARK_HOLD_MS + SYNC_MARK_FADE_MS)
+    ui->sync_mark.active = false;
+  return ui->sync_mark.active;
+}
 
 /* UI rendering */
 
@@ -123,11 +148,68 @@ static float zoom_factor(int count)
   return expf((float)count / 5000.0f);
 }
 
+static fz_point get_scale_factor(SDL_Window *window);
+
+static void render_sync_mark(fz_context *ctx, ui_state *ui)
+{
+  ui->sync_mark.last_frame = SDL_GetTicks();
+  if (!sync_mark_active(ui) || ui->sync_mark.page != ui->page)
+    return;
+
+  uint32_t elapsed = ui->sync_mark.last_frame - ui->sync_mark.ticks;
+  float strength = 1.0;
+  if (elapsed > SYNC_MARK_HOLD_MS)
+    strength = 1.0 - (float)(elapsed - SYNC_MARK_HOLD_MS) / SYNC_MARK_FADE_MS;
+  if (strength <= 0)
+    return;
+
+  fz_point scale = get_scale_factor(ui->window);
+  fz_point pt = txp_renderer_document_to_screen(ctx, ui->doc_renderer, ui->sync_mark.pt);
+  fz_rect box = ui->sync_mark.box;
+  bool has_box = !fz_is_empty_rect(box);
+  fz_point b0, b1;
+  if (has_box)
+  {
+    b0 = txp_renderer_document_to_screen(ctx, ui->doc_renderer, fz_make_point(box.x0, box.y0));
+    b1 = txp_renderer_document_to_screen(ctx, ui->doc_renderer, fz_make_point(box.x1, box.y1));
+  }
+  else
+  {
+    // No enclosing line box known: draw a caret of a typical line height.
+    b0 = txp_renderer_document_to_screen(ctx, ui->doc_renderer,
+                                         fz_make_point(ui->sync_mark.pt.x, ui->sync_mark.pt.y - 8));
+    b1 = txp_renderer_document_to_screen(ctx, ui->doc_renderer,
+                                         fz_make_point(ui->sync_mark.pt.x, ui->sync_mark.pt.y + 3));
+  }
+
+  SDL_SetRenderDrawBlendMode(ui->sdl_renderer, SDL_BLENDMODE_BLEND);
+
+  if (has_box)
+  {
+    // Soft band over the whole typeset line.
+    SDL_FRect band = {b0.x, b0.y - 1 * scale.y, b1.x - b0.x, b1.y - b0.y + 2 * scale.y};
+    SDL_SetRenderDrawColor(ui->sdl_renderer, 255, 170, 0, (Uint8)(48 * strength));
+    SDL_RenderFillRectF(ui->sdl_renderer, &band);
+  }
+
+  // Caret at the position itself, with a small halo so it stands out on
+  // both light and dark backgrounds.
+  float w = 3 * scale.x;
+  float pad = 2 * scale.y;
+  SDL_FRect halo = {pt.x - w, b0.y - 2 * pad, 3 * w, b1.y - b0.y + 4 * pad};
+  SDL_SetRenderDrawColor(ui->sdl_renderer, 255, 120, 0, (Uint8)(70 * strength));
+  SDL_RenderFillRectF(ui->sdl_renderer, &halo);
+  SDL_FRect caret = {pt.x - w / 2, b0.y - pad, w, b1.y - b0.y + 2 * pad};
+  SDL_SetRenderDrawColor(ui->sdl_renderer, 255, 80, 0, (Uint8)(230 * strength));
+  SDL_RenderFillRectF(ui->sdl_renderer, &caret);
+}
+
 static void render(fz_context *ctx, ui_state *ui)
 {
   SDL_SetRenderDrawColor(ui->sdl_renderer, 0, 0, 0, 255);
   SDL_RenderClear(ui->sdl_renderer);
   txp_renderer_render(ctx, ui->doc_renderer);
+  render_sync_mark(ctx, ui);
   SDL_RenderPresent(ui->sdl_renderer);
 }
 
@@ -458,7 +540,7 @@ static void pan_to(fz_context *ctx, ui_state *ui, enum pan_to to)
 
 static void previous_page(fz_context *ctx, ui_state *ui, bool pan)
 {
-  synctex_set_target(send(synctex, ui->eng, NULL), 0, NULL, 0);
+  synctex_set_target(send(synctex, ui->eng, NULL), 0, NULL, 0, -1);
   if (ui->page > 0)
   {
     ui->page -= 1;
@@ -481,7 +563,7 @@ static void previous_page(fz_context *ctx, ui_state *ui, bool pan)
 
 static void next_page(fz_context *ctx, ui_state *ui, bool pan)
 {
-  synctex_set_target(send(synctex, ui->eng, NULL), 0, NULL, 0);
+  synctex_set_target(send(synctex, ui->eng, NULL), 0, NULL, 0, -1);
   ui->page += 1;
   // FIXME: Same remark as in previous_page.
   if (pan)
@@ -1097,7 +1179,8 @@ static void interpret_command(struct persistent_state *ps,
       }
       else
       {
-        synctex_set_target(stx, ui->page, path, cmd.synctex_forward.line);
+        synctex_set_target(stx, ui->page, path, cmd.synctex_forward.line,
+                           cmd.synctex_forward.column);
         schedule_event(STDIN_EVENT);
       }
     }
@@ -1392,10 +1475,23 @@ bool texpresso_main(struct persistent_state *ps)
         bool rerun_eligible = ps->rerun_enabled
                               && rerun_count < MAX_RERUNS
                               && aux_ready;
-        if (rerun_eligible)
+        bool animating = sync_mark_active(ui);
+        if (animating)
+        {
+          uint32_t since = SDL_GetTicks() - ui->sync_mark.last_frame;
+          has_event = SDL_WaitEventTimeout(
+              &e, since >= SYNC_MARK_FRAME_MS ? 1 : SYNC_MARK_FRAME_MS - since);
+        }
+        else if (rerun_eligible)
           has_event = SDL_WaitEventTimeout(&e, T_IDLE_MS);
         else
           has_event = SDL_WaitEvent(&e);
+        if (!has_event && animating)
+        {
+          // Next frame of the sync marker fade-out.
+          render(ps->ctx, ui);
+          continue;
+        }
         if (!has_event)
         {
           if (rerun_eligible)
@@ -1415,10 +1511,12 @@ bool texpresso_main(struct persistent_state *ps)
       fz_buffer *buf;
       synctex_t *stx = send(synctex, ui->eng, &buf);
       int page = -1, x = -1, y = -1;
-      if (synctex_find_target(ps->ctx, stx, buf, &page, &x, &y))
+      fz_irect box = fz_empty_irect;
+      if (synctex_find_target(ps->ctx, stx, buf, &page, &x, &y, &box))
       {
-        fprintf(stderr, "[synctex forward] sync: hit page %d, coordinates (%d, %d)\n",
-                page, x, y);
+        fprintf(stderr, "[synctex forward] sync: hit page %d, coordinates (%d, %d), "
+                "line box (%d, %d)-(%d, %d)\n",
+                page, x, y, box.x0, box.y0, box.x1, box.y1);
 
         if (page != ui->page &&
             page >= 0 && page < send(page_count, ui->eng))
@@ -1431,6 +1529,15 @@ bool texpresso_main(struct persistent_state *ps)
         float f = send(scale_factor, ui->eng);
         fz_point p = fz_make_point(f * x, f * y);
         fz_point pt = txp_renderer_document_to_screen(ps->ctx, ui->doc_renderer, p);
+
+        ui->sync_mark.active = true;
+        ui->sync_mark.page = page;
+        ui->sync_mark.pt = p;
+        ui->sync_mark.box = fz_is_empty_irect(box)
+          ? fz_empty_rect
+          : fz_make_rect(f * box.x0, f * box.y0, f * box.x1, f * box.y1);
+        ui->sync_mark.ticks = SDL_GetTicks();
+        schedule_event(RENDER_EVENT);
         fprintf(stderr, "[synctex forward] position on screen: (%.02f, %.02f)\n",
                 pt.x, pt.y);
         int w, h;

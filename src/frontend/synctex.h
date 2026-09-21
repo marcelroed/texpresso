@@ -41,7 +41,10 @@ int synctex_input_offset(fz_context *ctx, synctex_t *stx, unsigned index);
 void synctex_scan(fz_context *ctx, synctex_t *stx, fz_buffer *buf, const char *doc_dir, unsigned page, int x, int y);
 
 int synctex_has_target(synctex_t *stx);
-void synctex_set_target(synctex_t *stx, int current_page, const char *path, int line);
-int synctex_find_target(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int *page, int *x, int *y);
+// column is 0-based (characters before the cursor), or -1 if unknown.
+void synctex_set_target(synctex_t *stx, int current_page, const char *path, int line, int column);
+// On a hit, *box receives the typeset line holding the position (empty
+// rectangle if unknown), in the same units as *x and *y.
+int synctex_find_target(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int *page, int *x, int *y, fz_irect *box);
 
 #endif // SYNCTEX_H_

@@ -25,6 +25,15 @@
 #define SYNCTEX_TAG_MODEL(NODE,TYPE) mem[NODE + TYPE##_NODE_SIZE - SYNCTEX_FIELD_SIZE].b32.s0
 #define SYNCTEX_LINE_MODEL(NODE,TYPE) mem[NODE + TYPE##_NODE_SIZE - SYNCTEX_FIELD_SIZE].b32.s1
 
+/* TeXpresso extension: the line field of a node also carries the column of
+ * the input reader when the node was created (see synctex_line_and_column).
+ * Records are written as "tag,line,column" which the SyncTeX grammar allows
+ * as an optional third component. */
+#define SYNCTEX_LINE_BITS 20
+#define SYNCTEX_COLUMN_MAX ((1 << (31 - SYNCTEX_LINE_BITS)) - 1)
+#define SYNCTEX_LINE_OF(L) ((L) & ((1 << SYNCTEX_LINE_BITS) - 1))
+#define SYNCTEX_COLUMN_OF(L) ((L) >> SYNCTEX_LINE_BITS)
+
 #define GLUE_NODE_SIZE MEDIUM_NODE_SIZE
 #define KERN_NODE_SIZE MEDIUM_NODE_SIZE
 #define MATH_NODE_SIZE MEDIUM_NODE_SIZE
@@ -135,6 +144,33 @@ get_current_name (void)
     return xstrdup(abspath_of_input_file);
 }
 
+
+/*  TeXpresso extension: the current line of the innermost file being read,
+ *  with the position of the reader in that line packed in the upper bits.
+ *  The reader position is the index of the next character to read, so the
+ *  column recorded for a node is (slightly past) the source text that
+ *  produced it. When the current level is a token list (macro expansion), the
+ *  nearest file level below it is used, which matches the meaning of `line`.
+ *  Lines beyond 2^20 are stored without a column. */
+int32_t
+synctex_line_and_column(void)
+{
+    if (line < 0 || line >= (1 << SYNCTEX_LINE_BITS))
+        return line;
+
+    input_state_t *in = &cur_input;
+    int32_t ptr = input_ptr;
+    while (in->state == TOKEN_LIST && ptr > 0)
+        in = &input_stack[--ptr];
+
+    int32_t col = 0;
+    if (in->state != TOKEN_LIST && in->loc > in->start)
+        col = in->loc - in->start;
+    if (col > SYNCTEX_COLUMN_MAX)
+        col = SYNCTEX_COLUMN_MAX;
+
+    return line | (col << SYNCTEX_LINE_BITS);
+}
 
 void
 synctex_init_command(void)
@@ -717,8 +753,10 @@ synctex_current(void)
     if (SYNCTEX_IGNORE(nothing))
         return;
 
-    len = ttstub_fprintf(synctex_ctxt.file, "x%i,%i:%i,%i\n",
-                  synctex_ctxt.tag,synctex_ctxt.line,
+    len = ttstub_fprintf(synctex_ctxt.file, "x%i,%i,%i:%i,%i\n",
+                  synctex_ctxt.tag,
+                  SYNCTEX_LINE_OF(synctex_ctxt.line),
+                  SYNCTEX_COLUMN_OF(synctex_ctxt.line),
                   SYNCTEX_CURH / synctex_ctxt.unit,
                   SYNCTEX_CURV / synctex_ctxt.unit);
     synctex_ctxt.lastv = SYNCTEX_CURV;
@@ -952,9 +990,10 @@ synctex_record_node_pdfrefxform(int objnum) /* UNUSED form JL */
 static inline void
 synctex_record_node_void_vlist(int32_t p)
 {
-    int len = ttstub_fprintf(synctex_ctxt.file, "v%i,%i:%i,%i:%i,%i,%i\n",
+    int len = ttstub_fprintf(synctex_ctxt.file, "v%i,%i,%i:%i,%i:%i,%i,%i\n",
                       SYNCTEX_TAG_MODEL(p,BOX),
-                      SYNCTEX_LINE_MODEL(p,BOX),
+                      SYNCTEX_LINE_OF(SYNCTEX_LINE_MODEL(p,BOX)),
+                      SYNCTEX_COLUMN_OF(SYNCTEX_LINE_MODEL(p,BOX)),
                       synctex_ctxt.curh / synctex_ctxt.unit,
                       synctex_ctxt.curv / synctex_ctxt.unit,
                       SYNCTEX_WIDTH(p) / synctex_ctxt.unit,
@@ -977,9 +1016,10 @@ synctex_record_node_vlist(int32_t p)
 
     synctex_ctxt.flags.not_void = 1;
 
-    len = ttstub_fprintf(synctex_ctxt.file, "[%i,%i:%i,%i:%i,%i,%i\n",
+    len = ttstub_fprintf(synctex_ctxt.file, "[%i,%i,%i:%i,%i:%i,%i,%i\n",
                   SYNCTEX_TAG_MODEL(p,BOX),
-                  SYNCTEX_LINE_MODEL(p,BOX),
+                  SYNCTEX_LINE_OF(SYNCTEX_LINE_MODEL(p,BOX)),
+                  SYNCTEX_COLUMN_OF(SYNCTEX_LINE_MODEL(p,BOX)),
                   synctex_ctxt.curh / synctex_ctxt.unit,
                   synctex_ctxt.curv / synctex_ctxt.unit,
                   SYNCTEX_WIDTH(p) / synctex_ctxt.unit,
@@ -1011,9 +1051,10 @@ synctex_record_node_tsilv(int32_t p __attribute__ ((unused)))
 static inline void
 synctex_record_node_void_hlist(int32_t p)
 {
-    int len = ttstub_fprintf(synctex_ctxt.file, "h%i,%i:%i,%i:%i,%i,%i\n",
+    int len = ttstub_fprintf(synctex_ctxt.file, "h%i,%i,%i:%i,%i:%i,%i,%i\n",
                       SYNCTEX_TAG_MODEL(p,BOX),
-                      SYNCTEX_LINE_MODEL(p,BOX),
+                      SYNCTEX_LINE_OF(SYNCTEX_LINE_MODEL(p,BOX)),
+                      SYNCTEX_COLUMN_OF(SYNCTEX_LINE_MODEL(p,BOX)),
                       synctex_ctxt.curh / synctex_ctxt.unit,
                       synctex_ctxt.curv / synctex_ctxt.unit,
                       SYNCTEX_WIDTH(p) / synctex_ctxt.unit,
@@ -1036,9 +1077,10 @@ synctex_record_node_hlist(int32_t p)
 
     synctex_ctxt.flags.not_void = 1;
 
-    len = ttstub_fprintf(synctex_ctxt.file, "(%i,%i:%i,%i:%i,%i,%i\n",
+    len = ttstub_fprintf(synctex_ctxt.file, "(%i,%i,%i:%i,%i:%i,%i,%i\n",
                   SYNCTEX_TAG_MODEL(p,BOX),
-                  SYNCTEX_LINE_MODEL(p,BOX),
+                  SYNCTEX_LINE_OF(SYNCTEX_LINE_MODEL(p,BOX)),
+                  SYNCTEX_COLUMN_OF(SYNCTEX_LINE_MODEL(p,BOX)),
                   synctex_ctxt.curh / synctex_ctxt.unit,
                   synctex_ctxt.curv / synctex_ctxt.unit,
                   SYNCTEX_WIDTH(p) / synctex_ctxt.unit,
@@ -1105,9 +1147,10 @@ synctex_record_postamble(void)
 static inline void
 synctex_record_node_glue(int32_t p)
 {
-    int len = ttstub_fprintf(synctex_ctxt.file, "g%i,%i:%i,%i\n",
+    int len = ttstub_fprintf(synctex_ctxt.file, "g%i,%i,%i:%i,%i\n",
                       SYNCTEX_TAG_MODEL(p,GLUE),
-                      SYNCTEX_LINE_MODEL(p,GLUE),
+                      SYNCTEX_LINE_OF(SYNCTEX_LINE_MODEL(p,GLUE)),
+                      SYNCTEX_COLUMN_OF(SYNCTEX_LINE_MODEL(p,GLUE)),
                       synctex_ctxt.curh / synctex_ctxt.unit,
                       synctex_ctxt.curv / synctex_ctxt.unit);
     synctex_ctxt.lastv = SYNCTEX_CURV;
@@ -1123,9 +1166,10 @@ synctex_record_node_glue(int32_t p)
 static inline void
 synctex_record_node_kern(int32_t p)
 {
-    int len = ttstub_fprintf(synctex_ctxt.file, "k%i,%i:%i,%i:%i\n",
+    int len = ttstub_fprintf(synctex_ctxt.file, "k%i,%i,%i:%i,%i:%i\n",
                       SYNCTEX_TAG_MODEL(p,GLUE),
-                      SYNCTEX_LINE_MODEL(p,GLUE),
+                      SYNCTEX_LINE_OF(SYNCTEX_LINE_MODEL(p,GLUE)),
+                      SYNCTEX_COLUMN_OF(SYNCTEX_LINE_MODEL(p,GLUE)),
                       synctex_ctxt.curh / synctex_ctxt.unit,
                       synctex_ctxt.curv / synctex_ctxt.unit,
                       SYNCTEX_WIDTH(p) / synctex_ctxt.unit);
@@ -1142,9 +1186,10 @@ synctex_record_node_kern(int32_t p)
 static inline void
 synctex_record_node_rule(int32_t p)
 {
-    int len = ttstub_fprintf(synctex_ctxt.file, "r%i,%i:%i,%i:%i,%i,%i\n",
+    int len = ttstub_fprintf(synctex_ctxt.file, "r%i,%i,%i:%i,%i:%i,%i,%i\n",
                       SYNCTEX_TAG_MODEL(p,RULE),
-                      SYNCTEX_LINE_MODEL(p,RULE),
+                      SYNCTEX_LINE_OF(SYNCTEX_LINE_MODEL(p,RULE)),
+                      SYNCTEX_COLUMN_OF(SYNCTEX_LINE_MODEL(p,RULE)),
                       synctex_ctxt.curh / synctex_ctxt.unit,
                       synctex_ctxt.curv / synctex_ctxt.unit,
                       rule_wd / synctex_ctxt.unit,
@@ -1163,9 +1208,10 @@ synctex_record_node_rule(int32_t p)
 static void
 synctex_record_node_math(int32_t p)
 {
-    int len = ttstub_fprintf(synctex_ctxt.file, "$%i,%i:%i,%i\n",
+    int len = ttstub_fprintf(synctex_ctxt.file, "$%i,%i,%i:%i,%i\n",
                       SYNCTEX_TAG_MODEL(p,MATH),
-                      SYNCTEX_LINE_MODEL(p,MATH),
+                      SYNCTEX_LINE_OF(SYNCTEX_LINE_MODEL(p,MATH)),
+                      SYNCTEX_COLUMN_OF(SYNCTEX_LINE_MODEL(p,MATH)),
                       synctex_ctxt.curh / synctex_ctxt.unit,
                       synctex_ctxt.curv / synctex_ctxt.unit);
     synctex_ctxt.lastv = SYNCTEX_CURV;

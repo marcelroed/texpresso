@@ -278,7 +278,7 @@ found:
     mem[r].b32.s1 = TEX_NULL;
     if (s >= MEDIUM_NODE_SIZE) {
         mem[r + s - 1].b32.s0 = cur_input.synctex_tag;
-        mem[r + s - 1].b32.s1 = line;
+        mem[r + s - 1].b32.s1 = synctex_line_and_column();
     }
     return r;
 }

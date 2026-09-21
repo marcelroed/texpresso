@@ -105,6 +105,7 @@ struct editor_command
     struct {
       const char *path;
       int line;
+      int column; // 0-based, or -1 if the editor did not send one
     } synctex_forward;
 
     struct {

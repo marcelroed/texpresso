@@ -162,9 +162,12 @@ at startup.
 
 ```scheme
 (synctex-forward "path" line)
+(synctex-forward "path" line column)
 ```
 
 Try to scroll the UI to the contents defined in TeX file at "path" and line. The path can be absolute or relative to the root document.
+
+The optional `column` (0-based, the number of characters before the cursor on that line) refines the position within the line: TeXpresso's engine records the position of the input reader in every SyncTeX record, so the viewer can point at the word under the cursor rather than at the first material of the line. The viewer briefly highlights the resulting position.
 
 ## Messages (texpresso -> editor)
 
