@@ -165,6 +165,11 @@ struct synctex_s
   /* The typeset line (innermost horizontal box) holding the candidate, in
      synctex units, or an empty rectangle when unknown. */
   fz_irect candidate_box;
+  /* Column of the record the candidate was derived from, and whether the
+     search is still open because the target column lies beyond every record
+     of the target line seen so far: a paragraph split across pages continues
+     on the next page with larger columns. */
+  int candidate_column, candidate_open;
 };
 
 synctex_t *synctex_new(fz_context *ctx)
@@ -830,6 +835,7 @@ static bool synctex_find_input(fz_context *ctx, synctex_t *stx, fz_buffer *buf)
     stx->scanned_pages = page;
     stx->input_found = 1;
     stx->candidate_page = -1;
+    stx->candidate_open = 0;
     return 1;
   }
 
@@ -890,6 +896,8 @@ static void set_candidate(synctex_t *stx, int page, const struct record *r, fz_i
   stx->candidate_y = r->point.y;
   stx->candidate_line = r->link.line;
   stx->candidate_box = box;
+  stx->candidate_column = r->link.column;
+  stx->candidate_open = 0;
   *updated = 1;
 }
 
@@ -1082,8 +1090,8 @@ synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page,
           if (use_column)
           {
             if (synctex_debug)
-              fprintf(stderr, "[synctex forward] line %d record kind %d column %d at (%d, %d)\n",
-                      r.link.line, r.kind, r.link.column, r.point.x, r.point.y);
+              fprintf(stderr, "[synctex forward] page %d line %d record kind %d column %d at (%d, %d)\n",
+                      page, r.link.line, r.kind, r.link.column, r.point.x, r.point.y);
             column_match_feed(&cm, &r, box, stx->target_column);
             continue;
           }
@@ -1106,6 +1114,10 @@ synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page,
     }
   }
 
+  // A candidate on the target line from a previous page, whose column search
+  // is still open (the target column was past all of that page's records).
+  int prev_open = stx->candidate_page != -1 && stx->candidate_open;
+
   if (exact_seen && cm.has_best)
   {
     past = column_match_result(&cm, stx->target_column);
@@ -1118,17 +1130,35 @@ synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page,
   {
     if (exact_seen)
     {
-      // The (refined) position on the target line supersedes whatever earlier
-      // line was recorded as a candidate, on this page or a previous one.
-      set_candidate(stx, page, &past, past_box, updated_candidate);
+      if (use_column && cm.has_best)
+      {
+        // Refined position. It supersedes an open candidate from a previous
+        // page only if it is closer to the target column (a synthetic
+        // column-0 start on this page is not).
+        if (!prev_open || cm.best.link.column > stx->candidate_column)
+          set_candidate(stx, page, &past, past_box, updated_candidate);
+        if (!cm.has_next)
+        {
+          // Nothing past the target column on this page: the paragraph may
+          // continue on the next page. Keep looking.
+          stx->candidate_open = 1;
+          return;
+        }
+      }
+      else if (!prev_open)
+        // The (refined) position on the target line supersedes whatever
+        // earlier line was recorded as a candidate, on this page or a
+        // previous one.
+        set_candidate(stx, page, &past, past_box, updated_candidate);
     }
-    else if (stx->candidate_page != page)
+    else if (stx->candidate_page != page && !prev_open)
     {
       // The beginning and ending of the match crosses two (or more?) pages.
       // Use current page to decide which one to keep.
       if (stx->target_current_page == page)
         set_candidate(stx, page, &past, past_box, updated_candidate);
     }
+    stx->candidate_open = 0;
     synctex_clear_search(stx);
     return;
   }
