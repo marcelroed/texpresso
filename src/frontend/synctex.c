@@ -1010,6 +1010,14 @@ synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page,
   // line starts (the source line began mid-paragraph).
   struct record prev = {0,};
   int has_prev = 0;
+  // First record of the target line, and whether the line's records carry
+  // more than one column. They all share one when the material was typeset
+  // from a token list (the body of amsmath's align is collected and typeset
+  // at its \end line): the column is then the reader position after the
+  // macro and says nothing about the position within the line.
+  struct record first_exact = {0,};
+  fz_irect first_exact_box = fz_empty_irect;
+  int columns_vary = 0;
 
   while ((ptr = parse_line(ptr, &r)))
   {
@@ -1069,6 +1077,8 @@ synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page,
             past = r;
             past_box = box;
             past_seen = 1;
+            first_exact = r;
+            first_exact_box = box;
             if (use_column && r.link.column > 0)
             {
               // Synthetic record for column 0: the end of the preceding
@@ -1089,6 +1099,8 @@ synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page,
           }
           if (use_column)
           {
+            if (r.link.column != first_exact.link.column)
+              columns_vary = 1;
             if (synctex_debug)
               fprintf(stderr, "[synctex forward] page %d line %d record kind %d column %d at (%d, %d)\n",
                       page, r.link.line, r.kind, r.link.column, r.point.x, r.point.y);
@@ -1120,8 +1132,19 @@ synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page,
 
   if (exact_seen && cm.has_best)
   {
-    past = column_match_result(&cm, stx->target_column);
-    past_box = cm.best_box;
+    if (columns_vary)
+    {
+      past = column_match_result(&cm, stx->target_column);
+      past_box = cm.best_box;
+    }
+    else
+    {
+      // Uninformative columns: the start of the line's material.
+      past = first_exact;
+      past_box = first_exact_box;
+      cm.best = first_exact;
+      cm.has_next = 1;
+    }
   }
 
   // Definitive match: the target line, or a line past it, was seen on this
@@ -1151,12 +1174,19 @@ synctex_backscan_page(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int page,
         // previous one.
         set_candidate(stx, page, &past, past_box, updated_candidate);
     }
-    else if (stx->candidate_page != page && !prev_open)
+    else if (!prev_open)
     {
-      // The beginning and ending of the match crosses two (or more?) pages.
-      // Use current page to decide which one to keep.
-      if (stx->target_current_page == page)
-        set_candidate(stx, page, &past, past_box, updated_candidate);
+      // No record of the target line, but a later line has some (on this
+      // page; an earlier line may have some on this or a previous page).
+      // TeX attributes material to the source line where it was finished:
+      // a paragraph's lines to the line that ended the paragraph, the body
+      // of a collected environment (amsmath's align, a caption, ...) to its
+      // \end line. So the first record of the nearest later line is a better
+      // guess for the target than the last record of an earlier line.
+      if (synctex_debug)
+        fprintf(stderr, "[synctex forward] page %d: no record for line %d, using first record of line %d at (%d, %d)\n",
+                page, line, past.link.line, past.point.x, past.point.y);
+      set_candidate(stx, page, &past, past_box, updated_candidate);
     }
     stx->candidate_open = 0;
     synctex_clear_search(stx);
