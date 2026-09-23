@@ -122,8 +122,15 @@ typedef struct {
     int page;
     fz_point pt;
     fz_rect box; // typeset line holding pt, empty if unknown
+    bool no_caret; // pt is unreliable, only highlight box
     uint32_t ticks, last_frame;
   } sync_mark;
+
+  // Last forward sync request (the path relative to the document).
+  struct {
+    char path[1024];
+    int line, column;
+  } sync_target;
 } ui_state;
 
 // The marker is shown at full strength for SYNC_MARK_HOLD_MS, then fades
@@ -192,6 +199,9 @@ static void render_sync_mark(fz_context *ctx, ui_state *ui)
     SDL_RenderFillRectF(ui->sdl_renderer, &band);
   }
 
+  if (ui->sync_mark.no_caret)
+    return;
+
   // Caret at the position itself, with a small halo so it stands out on
   // both light and dark backgrounds.
   float w = 3 * scale.x;
@@ -202,6 +212,243 @@ static void render_sync_mark(fz_context *ctx, ui_state *ui)
   SDL_FRect caret = {pt.x - w / 2, b0.y - pad, w, b1.y - b0.y + 2 * pad};
   SDL_SetRenderDrawColor(ui->sdl_renderer, 255, 80, 0, (Uint8)(230 * strength));
   SDL_RenderFillRectF(ui->sdl_renderer, &caret);
+}
+
+/* Forward sync refinement by text.
+
+   SyncTeX locates some material only coarsely: a caption or the body of an
+   align environment is read as a macro argument and typeset at its last
+   line, so all of it carries that line and one column, and the records of a
+   TikZ picture are not where its content is drawn. In those cases, look for
+   the words around the editor cursor in the text of the page. */
+
+#define SYNC_TEXT_MAX 512
+
+struct sync_word {
+  int start, end;          // characters of the line, [start, end)
+  int first, count;        // folded characters, in sync_text.chars
+};
+
+struct sync_text {
+  int chars[SYNC_TEXT_MAX];     // folded characters of all words
+  int source[SYNC_TEXT_MAX];    // their index in the line
+  int nchars;
+  struct sync_word words[SYNC_TEXT_MAX];
+  int nwords;
+};
+
+static bool sync_macro_skips_argument(const char *name)
+{
+  static const char *names[] = {
+    "label", "ref", "autoref", "cref", "Cref", "eqref", "pageref", "nameref",
+    "cite", "citep", "citet", "citealp", "citeauthor", "citeyear", "nocite",
+    "includegraphics", "begin", "end", "input", "include", "usepackage",
+    "documentclass", "bibliographystyle", "bibliography", "textcolor",
+    "color", "definecolor", "colorlet", "pgfmathsetmacro", "newcommand",
+    "renewcommand", "hypersetup", "href", "tikzset", "vspace", "hspace",
+    "setlength", "addtolength", "def", NULL
+  };
+  for (const char **n = names; *n; n++)
+    if (strcmp(*n, name) == 0)
+      return true;
+  return false;
+}
+
+// Skip a balanced group starting at line[i] (which is `open`), returning the
+// index after it.
+static int sync_skip_group(const int *line, int n, int i, int open, int close)
+{
+  int depth = 0;
+  for (; i < n; i++)
+  {
+    if (line[i] == '\\')
+      i++;
+    else if (line[i] == open)
+      depth++;
+    else if (line[i] == close && --depth == 0)
+      return i + 1;
+  }
+  return n;
+}
+
+// Split a source line into the words likely to be typeset as text: macro
+// names, math, optional arguments, and the arguments of macros that do not
+// typeset text are left out.
+static void sync_source_words(const int *line, int n, struct sync_text *t)
+{
+  t->nchars = t->nwords = 0;
+  bool math = false, in_word = false;
+  int i = 0;
+  while (i < n && t->nchars < SYNC_TEXT_MAX && t->nwords < SYNC_TEXT_MAX)
+  {
+    int c = line[i];
+    if (c == '%')
+      break;
+    if (c == '\\' && i + 1 < n)
+    {
+      int d = line[i + 1];
+      if ((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') || d == '@')
+      {
+        char name[32];
+        int j = i + 1, k = 0;
+        while (j < n && ((line[j] >= 'a' && line[j] <= 'z') ||
+                         (line[j] >= 'A' && line[j] <= 'Z') || line[j] == '@'))
+        {
+          if (k < 31)
+            name[k++] = line[j];
+          j++;
+        }
+        name[k] = 0;
+        in_word = false;
+        i = j;
+        if (!math && sync_macro_skips_argument(name))
+        {
+          if (strcmp(name, "def") == 0)
+            // \def\name{...}
+            while (i < n && line[i] != '{')
+              i++;
+          while (i < n && line[i] == ' ')
+            i++;
+          if (i < n && line[i] == '[')
+            i = sync_skip_group(line, n, i, '[', ']');
+          if (i < n && line[i] == '{')
+            i = sync_skip_group(line, n, i, '{', '}');
+          if (i < n && line[i] == '[')
+            i = sync_skip_group(line, n, i, '[', ']');
+        }
+        continue;
+      }
+      if (d == '(' || d == '[')
+        math = true, in_word = false;
+      else if (d == ')' || d == ']')
+        math = false, in_word = false;
+      // Other control symbols (accents, \_, \&, ...) do not split words.
+      i += 2;
+      continue;
+    }
+    if (c == '$')
+    {
+      math = !math;
+      in_word = false;
+      i++;
+      continue;
+    }
+    if (math)
+    {
+      i++;
+      continue;
+    }
+    if (c == '[')
+    {
+      in_word = false;
+      i = sync_skip_group(line, n, i, '[', ']');
+      continue;
+    }
+    int f = txp_fold_char(c);
+    if (f)
+    {
+      if (!in_word)
+      {
+        struct sync_word *w = &t->words[t->nwords++];
+        w->start = i;
+        w->first = t->nchars;
+        w->count = 0;
+        in_word = true;
+      }
+      struct sync_word *w = &t->words[t->nwords - 1];
+      t->chars[t->nchars] = f;
+      t->source[t->nchars] = i;
+      t->nchars++;
+      w->count++;
+      w->end = i + 1;
+    }
+    else if (c != '{' && c != '}')
+      in_word = false;
+    i++;
+  }
+}
+
+static bool sync_refine_by_text(struct persistent_state *ps, ui_state *ui,
+                                fz_point anchor, fz_rect region, bool region_only,
+                                fz_point *out, fz_rect *out_line)
+{
+  int column = ui->sync_target.column;
+  if (column < 0 || !ui->sync_target.path[0])
+    return false;
+
+  fileentry_t *e = send(find_file, ui->eng, ps->ctx, ui->sync_target.path);
+  fz_buffer *data = e ? (e->edit_data ? e->edit_data : e->fs_data) : NULL;
+  if (!data)
+    return false;
+
+  // Find the line (1-based) and decode it.
+  const char *p = (const char *)data->data, *end = p + data->len;
+  for (int l = 1; l < ui->sync_target.line && p < end; l++)
+  {
+    const char *nl = memchr(p, '\n', end - p);
+    p = nl ? nl + 1 : end;
+  }
+  if (p >= end)
+    return false;
+  static int line[4096];
+  int n = 0;
+  while (p < end && *p != '\n' && n < 4096)
+  {
+    int c;
+    p += fz_chartorune(&c, p);
+    line[n++] = c;
+  }
+
+  static struct sync_text t;
+  sync_source_words(line, n, &t);
+  if (t.nwords == 0)
+    return false;
+
+  // The word under the cursor (or right before it), else the next one, else
+  // the last one.
+  int k = -1;
+  for (int i = 0; i < t.nwords; i++)
+    if (t.words[i].start <= column && column <= t.words[i].end)
+    {
+      k = i;
+      break;
+    }
+  if (k == -1)
+    for (int i = 0; i < t.nwords && k == -1; i++)
+      if (t.words[i].start > column)
+        k = i;
+  if (k == -1)
+    k = t.nwords - 1;
+
+  // Number of folded characters of word k before the cursor.
+  int in_word = 0;
+  while (in_word < t.words[k].count &&
+         t.source[t.words[k].first + in_word] < column)
+    in_word++;
+
+  // Try the longest needles first: a single short word matches anywhere.
+  static const int spans[][2] = {{0, 2}, {-1, 1}, {0, 1}, {-1, 0}, {-2, 0}, {0, 0}};
+  for (int s = 0; s < (int)(sizeof(spans) / sizeof(spans[0])); s++)
+  {
+    int a = k + spans[s][0], b = k + spans[s][1];
+    if (a < 0 || b >= t.nwords)
+      continue;
+    int first = t.words[a].first;
+    int len = t.words[b].first + t.words[b].count - first;
+    if (len < 4 || (a == b && len < 5))
+      continue;
+    int offset = t.words[k].first - first + in_word;
+    if (txp_renderer_find_text(ps->ctx, ui->doc_renderer, t.chars + first, len,
+                               offset, anchor, region, out, out_line))
+    {
+      if (region_only &&
+          !fz_is_point_inside_rect(*out, fz_expand_rect(region, 2)))
+        // Matched outside the picture only: not trustworthy.
+        return false;
+      return true;
+    }
+  }
+  return false;
 }
 
 static void render(fz_context *ctx, ui_state *ui)
@@ -1181,6 +1428,9 @@ static void interpret_command(struct persistent_state *ps,
       {
         synctex_set_target(stx, ui->page, path, cmd.synctex_forward.line,
                            cmd.synctex_forward.column);
+        snprintf(ui->sync_target.path, sizeof(ui->sync_target.path), "%s", path);
+        ui->sync_target.line = cmd.synctex_forward.line;
+        ui->sync_target.column = cmd.synctex_forward.column;
         schedule_event(STDIN_EVENT);
       }
     }
@@ -1528,14 +1778,40 @@ bool texpresso_main(struct persistent_state *ps)
         // FIXME: Scroll to point
         float f = send(scale_factor, ui->eng);
         fz_point p = fz_make_point(f * x, f * y);
+        fz_rect mark_box = fz_is_empty_irect(box)
+          ? fz_empty_rect
+          : fz_make_rect(f * box.x0, f * box.y0, f * box.x1, f * box.y1);
+        bool no_caret = false;
+
+        int precision = synctex_candidate_imprecise(stx);
+        if (precision && page == ui->page)
+        {
+          bool floating = precision & SYNCTEX_FLOATING;
+          // Only trust matches inside the picture when the target line
+          // itself was found there.
+          bool in_picture = floating && !(precision & SYNCTEX_OTHER_LINE);
+          fz_point tp;
+          fz_rect tl;
+          if (sync_refine_by_text(ps, ui, p, floating ? mark_box : fz_empty_rect,
+                                  in_picture, &tp, &tl))
+          {
+            fprintf(stderr, "[synctex forward] refined by text: (%.02f, %.02f)\n",
+                    tp.x, tp.y);
+            p = tp;
+            mark_box = tl;
+          }
+          else
+            // Coordinates inside a TikZ picture are not where the material
+            // is drawn: only highlight the picture.
+            no_caret = floating;
+        }
         fz_point pt = txp_renderer_document_to_screen(ps->ctx, ui->doc_renderer, p);
 
         ui->sync_mark.active = true;
         ui->sync_mark.page = page;
         ui->sync_mark.pt = p;
-        ui->sync_mark.box = fz_is_empty_irect(box)
-          ? fz_empty_rect
-          : fz_make_rect(f * box.x0, f * box.y0, f * box.x1, f * box.y1);
+        ui->sync_mark.box = mark_box;
+        ui->sync_mark.no_caret = no_caret;
         ui->sync_mark.ticks = SDL_GetTicks();
         schedule_event(RENDER_EVENT);
         fprintf(stderr, "[synctex forward] position on screen: (%.02f, %.02f)\n",

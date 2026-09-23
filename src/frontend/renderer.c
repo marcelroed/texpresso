@@ -995,3 +995,104 @@ void txp_renderer_screen_size(fz_context *ctx, txp_renderer *self, int *w, int *
   *w = self->output_w;
   *h = self->output_h;
 }
+
+/* Text search for forward sync */
+
+// Fold a character to the form used for matching source text against page
+// text: lower case, Latin-1 accents removed; 0 for characters that do not
+// take part (punctuation, spaces, symbols).
+int txp_fold_char(int c)
+{
+  if (c < 128)
+  {
+    if (c >= 'A' && c <= 'Z')
+      return c + 32;
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))
+      return c;
+    return 0;
+  }
+  static const char latin1[] =
+    "aaaaaaaceeeeiiii" "dnooooo\0ouuuuyts" // U+00C0 .. U+00DF
+    "aaaaaaaceeeeiiii" "dnooooo\0ouuuuyty"; // U+00E0 .. U+00FF
+  if (c >= 0xC0 && c <= 0xFF)
+    return latin1[c - 0xC0];
+  if ((c >= 0x2000 && c <= 0x2BFF) || (c >= 0xE000 && c <= 0xF8FF) ||
+      (c >= 0xFE00 && c <= 0xFE0F))
+    return 0;
+  return fz_tolower(c);
+}
+
+struct text_char {
+  int c;
+  fz_point origin;
+  fz_rect char_box, line_box;
+};
+
+bool txp_renderer_find_text(fz_context *ctx, txp_renderer *self,
+                            const int *needle, int len, int offset,
+                            fz_point anchor, fz_rect region,
+                            fz_point *out, fz_rect *out_line)
+{
+  fz_stext_page *page = get_stext(ctx, self);
+  if (!page || len <= 0)
+    return 0;
+
+  int n = 0, cap = 0;
+  struct text_char *text = NULL;
+  for (fz_stext_block *b = page->first_block; b; b = b->next)
+  {
+    if (b->type != FZ_STEXT_BLOCK_TEXT)
+      continue;
+    for (fz_stext_line *l = b->u.t.first_line; l; l = l->next)
+      for (fz_stext_char *ch = l->first_char; ch; ch = ch->next)
+      {
+        int c = txp_fold_char(ch->c);
+        if (!c)
+          continue;
+        if (n == cap)
+        {
+          cap = cap ? cap * 2 : 1024;
+          text = fz_realloc(ctx, text, cap * sizeof(*text));
+        }
+        text[n].c = c;
+        text[n].origin = ch->origin;
+        text[n].char_box = fz_rect_from_quad(ch->quad);
+        text[n].line_box = l->bbox;
+        n++;
+      }
+  }
+
+  // Rank of a match: inside the region first, then after the anchor in
+  // reading order (the first such match), then before it (the last one).
+  int best = -1, best_rank = 0;
+  bool has_region = !fz_is_empty_rect(region);
+  for (int i = 0; i + len <= n; i++)
+  {
+    int j = 0;
+    while (j < len && text[i + j].c == needle[j])
+      j++;
+    if (j < len)
+      continue;
+    fz_point p = text[i].origin;
+    bool inside = has_region && fz_is_point_inside_rect(p, fz_expand_rect(region, 2));
+    bool after = p.y > anchor.y + 2 || (fabsf(p.y - anchor.y) <= 2 && p.x >= anchor.x - 1);
+    int rank = (inside ? 0 : 2) + (after ? 0 : 1);
+    if (best == -1 || rank < best_rank || (rank == best_rank && (rank & 1)))
+    {
+      best = i;
+      best_rank = rank;
+    }
+  }
+
+  if (best >= 0)
+  {
+    if (offset < len)
+      *out = fz_make_point(text[best + offset].char_box.x0, text[best + offset].origin.y);
+    else
+      *out = fz_make_point(text[best + len - 1].char_box.x1, text[best + len - 1].origin.y);
+    int k = offset < len ? offset : len - 1;
+    *out_line = text[best + k].line_box;
+  }
+  fz_free(ctx, text);
+  return best >= 0;
+}

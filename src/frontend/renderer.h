@@ -88,4 +88,19 @@ void txp_renderer_screen_size(fz_context *ctx, txp_renderer *self, int *w, int *
 fz_point txp_renderer_screen_to_document(fz_context *ctx, txp_renderer *self, fz_point pt);
 fz_point txp_renderer_document_to_screen(fz_context *ctx, txp_renderer *self, fz_point pt);
 
+// Fold a character for text matching (lower case, no accents), or 0 when it
+// does not take part (punctuation, spaces).
+int txp_fold_char(int c);
+
+// Find `needle` (folded characters, see txp_fold_char) in the text of the
+// displayed page, ignoring non-matching characters. Among the matches,
+// prefer one inside `region` (when not empty), then the first one after
+// `anchor` in reading order. On success, *out is the left edge of the
+// character at `offset` on its baseline (the end of the match if offset ==
+// len) and *out_line the bounding box of its text line.
+bool txp_renderer_find_text(fz_context *ctx, txp_renderer *self,
+                            const int *needle, int len, int offset,
+                            fz_point anchor, fz_rect region,
+                            fz_point *out, fz_rect *out_line);
+
 #endif /*!_RENDERER_H_*/

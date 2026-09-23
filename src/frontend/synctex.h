@@ -45,6 +45,16 @@ int synctex_has_target(synctex_t *stx);
 void synctex_set_target(synctex_t *stx, int current_page, const char *path, int line, int column);
 // On a hit, *box receives the typeset line holding the position (empty
 // rectangle if unknown), in the same units as *x and *y.
+// How precise the last candidate found by synctex_find_target is: 0, or
+// SYNCTEX_IMPRECISE when it locates the target line only coarsely (no record
+// of the line, or no usable column), plus SYNCTEX_FLOATING when its
+// coordinates are not where the material is drawn (inside a TikZ picture);
+// the box is then the enclosing picture. SYNCTEX_OTHER_LINE is set when the
+// target line has no record and the candidate is the nearest other line.
+#define SYNCTEX_IMPRECISE 1
+#define SYNCTEX_FLOATING 2
+#define SYNCTEX_OTHER_LINE 4
+int synctex_candidate_imprecise(synctex_t *stx);
 int synctex_find_target(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int *page, int *x, int *y, fz_irect *box);
 
 #endif // SYNCTEX_H_
