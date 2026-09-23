@@ -1139,6 +1139,51 @@ static cursor_t parse_pdf_string(char *buf, char *end, cursor_t cur, cursor_t li
   return cur;
 }
 
+static bool has_prefix(cursor_t cur, cursor_t lim, const char *prefix)
+{
+  size_t n = strlen(prefix);
+  return (size_t)(lim - cur) >= n && memcmp(cur, prefix, n) == 0;
+}
+
+// Start collecting a link annotation. Its target is a named destination
+// (/D(name), stored as "#name") or an external URI (/URI(...)).
+static bool pdf_link_begin(fz_context *ctx, dvi_context *dc, cursor_t cur, cursor_t lim)
+{
+  if (!dc->links)
+    return 1;
+  char target[2048];
+  for (; cur < lim; ++cur)
+  {
+    if (has_prefix(cur, lim, "/URI("))
+    {
+      parse_pdf_string(target, target + sizeof(target), cur + 5, lim);
+      dvi_links_begin(ctx, dc->links, target);
+      return 1;
+    }
+    if (has_prefix(cur, lim, "/D("))
+    {
+      target[0] = '#';
+      parse_pdf_string(target + 1, target + sizeof(target), cur + 3, lim);
+      dvi_links_begin(ctx, dc->links, target);
+      return 1;
+    }
+  }
+  // Unsupported kind of link
+  dvi_links_end(ctx, dc->links);
+  return 1;
+}
+
+static bool pdf_dest(fz_context *ctx, dvi_context *dc, dvi_state *st, cursor_t cur, cursor_t lim)
+{
+  if (!dc->links)
+    return 1;
+  char name[2048];
+  parse_pdf_string(name, name + sizeof(name), cur, lim);
+  fz_point pt = fz_transform_point_xy(0, 0, dvi_get_ctm(dc, st));
+  dvi_links_add_dest(ctx, dc->links, name, pt);
+  return 1;
+}
+
 static bool
 dvi_exec_pdf(fz_context *ctx, dvi_context *dc, dvi_state *st, cursor_t cur, cursor_t lim)
 {
@@ -1206,6 +1251,19 @@ dvi_exec_pdf(fz_context *ctx, dvi_context *dc, dvi_state *st, cursor_t cur, curs
 
   "code"
   { return pdf_code(ctx, dc, st, cur, lim); }
+
+  ("beginann" | "bann") ws*
+  { return pdf_link_begin(ctx, dc, cur, lim); }
+
+  ("endann" | "eann")
+  {
+    if (dc->links)
+      dvi_links_end(ctx, dc->links);
+    return 1;
+  }
+
+  "dest" ws* "("
+  { return pdf_dest(ctx, dc, st, cur, lim); }
 
   ''
   { return unhandled("pdf special", cur, lim, 0); }

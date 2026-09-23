@@ -36,6 +36,8 @@ struct incdvi_s
   int page_len, page_cap;
   int *pages;
   dvi_context *dc;
+  // Page whose links are in dc->links, or -1
+  int links_page;
 };
 
 static int add_page(fz_context *ctx, incdvi_t *d)
@@ -65,6 +67,8 @@ incdvi_t *incdvi_new(fz_context *ctx, dvi_reshooks hooks)
 {
   incdvi_t *d = fz_malloc_struct(ctx, incdvi_t);
   d->dc = dvi_context_new(ctx, hooks);
+  d->dc->links = fz_malloc_struct(ctx, dvi_links);
+  d->links_page = -1;
   return d;
 }
 
@@ -81,6 +85,7 @@ void incdvi_reset(incdvi_t *d)
   d->offset = 0;
   d->fontdef_offset = 0;
   d->page_len = 0;
+  d->links_page = -1;
 }
 
 void incdvi_update(fz_context *ctx, incdvi_t *d, fz_buffer *buf)
@@ -92,6 +97,7 @@ void incdvi_update(fz_context *ctx, incdvi_t *d, fz_buffer *buf)
   }
 
   int len = buf->len;
+  d->links_page = -1;
 
   if (d->offset > len)
   {
@@ -208,6 +214,62 @@ void incdvi_render_page(fz_context *ctx, incdvi_t *d, fz_buffer *buf, int page, 
     offset += ilen;
   }
   dvi_context_end_frame(ctx, dc);
+  d->links_page = page;
+}
+
+// Make sure dc->links holds the links of a page
+static void collect_links(fz_context *ctx, incdvi_t *d, fz_buffer *buf, int page)
+{
+  if (d->links_page == page)
+    return;
+  fz_device *dev = fz_new_device_of_size(ctx, sizeof(fz_device));
+  fz_try(ctx)
+  {
+    incdvi_render_page(ctx, d, buf, page, dev);
+    fz_close_device(ctx, dev);
+  }
+  fz_always(ctx)
+    fz_drop_device(ctx, dev);
+  fz_catch(ctx)
+  {
+    d->links_page = -1;
+    fz_rethrow(ctx);
+  }
+}
+
+fz_link *incdvi_load_links(fz_context *ctx, incdvi_t *d, fz_buffer *buf, int page)
+{
+  if (page < 0 || page >= incdvi_page_count(d))
+    return NULL;
+  collect_links(ctx, d, buf, page);
+  dvi_links *l = d->dc->links;
+  fz_link *head = NULL, **tail = &head;
+  for (int i = 0; i < l->link_count; ++i)
+  {
+    *tail = fz_new_link_of_size(ctx, sizeof(fz_link), l->links[i].rect,
+                                l->links[i].target);
+    tail = &(*tail)->next;
+  }
+  return head;
+}
+
+bool incdvi_find_dest(fz_context *ctx, incdvi_t *d, fz_buffer *buf,
+                      const char *name, int *page, fz_point *pt)
+{
+  int count = incdvi_page_count(d);
+  for (int p = 0; p < count; ++p)
+  {
+    collect_links(ctx, d, buf, p);
+    dvi_links *l = d->dc->links;
+    for (int i = 0; i < l->dest_count; ++i)
+      if (strcmp(l->dests[i].name, name) == 0)
+      {
+        *page = p;
+        *pt = l->dests[i].pt;
+        return 1;
+      }
+  }
+  return 0;
 }
 
 float incdvi_tex_scale_factor(incdvi_t *d)

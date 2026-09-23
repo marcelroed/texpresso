@@ -1167,6 +1167,25 @@ static fz_display_list *engine_render_page(txp_engine *_self, fz_context *ctx, i
   return dl;
 }
 
+static fz_link *engine_load_links(txp_engine *_self, fz_context *ctx, int page)
+{
+  SELF;
+  fz_buffer *data = self->st.document.entry->saved.data;
+  if (!data)
+    return NULL;
+  return incdvi_load_links(ctx, self->dvi, data, page);
+}
+
+static bool engine_resolve_link(txp_engine *_self, fz_context *ctx,
+                                const char *uri, int *page, fz_point *pt)
+{
+  SELF;
+  fz_buffer *data = self->st.document.entry->saved.data;
+  if (!data || uri[0] != '#')
+    return 0;
+  return incdvi_find_dest(ctx, self->dvi, data, uri + 1, page, pt);
+}
+
 static bool engine_step(txp_engine *_self, fz_context *ctx, bool restart_if_needed)
 {
   SELF;

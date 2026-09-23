@@ -74,6 +74,16 @@ static fz_text *get_text(fz_context *ctx, dvi_context *dc)
   return dc->text;
 }
 
+// Extend the link being collected with a glyph drawn at trm
+static void link_glyph(fz_context *ctx, dvi_context *dc, fz_font *font, int gid, fz_matrix trm)
+{
+  if (!dc->links || !dc->links->active)
+    return;
+  float adv = fz_advance_glyph(ctx, font, gid, 0);
+  fz_rect box = fz_transform_rect(fz_make_rect(0, -0.25f, adv, 0.8f), trm);
+  dvi_links_add_glyph(ctx, dc->links, box);
+}
+
 static dvi_fontdef *dvi_current_font(fz_context *ctx, dvi_state *st)
 {
   return dvi_fonttable_get(ctx, st->fonts, st->f);
@@ -133,13 +143,12 @@ void dvi_exec_char(fz_context *ctx, dvi_context *dc, dvi_state *st, uint32_t c, 
         u = fz_encode_character(ctx, font->fz, c);
       }
 
+      float s = dc->scale * scale_factor.value;
+      fz_matrix trm = fz_pre_scale(dvi_get_ctm(dc, st), s, s);
       if (dc->dev)
-      {
-        float s = dc->scale * scale_factor.value;
-        fz_show_glyph(ctx, get_text(ctx, dc), font->fz,
-                      fz_pre_scale(dvi_get_ctm(dc, st), s, s), u, c, 0, 0,
+        fz_show_glyph(ctx, get_text(ctx, dc), font->fz, trm, u, c, 0, 0,
                       FZ_BIDI_LTR, FZ_LANG_UNSET);
-      }
+      link_glyph(ctx, dc, font->fz, u, trm);
     }
     else if (font->vf)
     {
@@ -334,7 +343,8 @@ void dvi_exec_xdvglyphs(fz_context *ctx, dvi_context *dc, dvi_state *st, fixed_t
   }
   fz_font *font = def->xdv_font.font;
   fixed_t size = def->xdv_font.spec.size;
-  if (!dc->dev);
+  bool linking = dc->links && dc->links->active;
+  if (!dc->dev && !linking);
   else if (font)
   {
     float ds = dc->scale;
@@ -342,18 +352,18 @@ void dvi_exec_xdvglyphs(fz_context *ctx, dvi_context *dc, dvi_state *st, fixed_t
 
     int32_t sh = st->registers.h - st->gs.h;
     int32_t sv = st->registers.v + dy0.value - st->gs.v;
-    if (dc->dev)
+    fz_text *text = dc->dev ? get_text(ctx, dc) : NULL;
+    for (int i = 0; i < num_glyphs; ++i)
     {
-      fz_text *text = get_text(ctx, dc);
-      for (int i = 0; i < num_glyphs; ++i)
-      {
-        int32_t h = sh + dx[i].value;
-        int32_t v = dy ? sv + dy[i].value : sv;
-        fz_matrix ctm =
-            fz_pre_scale(fz_pre_translate(st->gs.ctm, h * ds, -v * ds), fs, fs);
+      int32_t h = sh + dx[i].value;
+      int32_t v = dy ? sv + dy[i].value : sv;
+      fz_matrix ctm =
+          fz_pre_scale(fz_pre_translate(st->gs.ctm, h * ds, -v * ds), fs, fs);
+      if (text)
         fz_show_glyph(ctx, text, font, ctm, glyphs[i], 0, 0, 0, FZ_BIDI_LTR,
                       FZ_LANG_UNSET);
-      }
+      if (linking)
+        link_glyph(ctx, dc, font, glyphs[i], ctm);
     }
   }
   else

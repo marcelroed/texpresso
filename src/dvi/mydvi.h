@@ -319,6 +319,40 @@ typedef struct
   dvi_fonttable *fonts;
 } dvi_state;
 
+// Hyperlinks and named destinations found while interpreting a page
+// (pdf:bann / pdf:eann / pdf:dest specials, as emitted by hyperref).
+// Coordinates are in document space.
+
+typedef struct
+{
+  fz_rect rect;
+  char *target; // "#name" for a named destination, or an external URI
+} dvi_link;
+
+typedef struct
+{
+  char *name;
+  fz_point pt;
+} dvi_dest;
+
+typedef struct
+{
+  // Link being collected (between bann and eann)
+  char *active;
+  fz_rect rect;
+
+  dvi_link *links;
+  int link_count, link_cap;
+  dvi_dest *dests;
+  int dest_count, dest_cap;
+} dvi_links;
+
+void dvi_links_clear(fz_context *ctx, dvi_links *l);
+void dvi_links_begin(fz_context *ctx, dvi_links *l, const char *target);
+void dvi_links_end(fz_context *ctx, dvi_links *l);
+void dvi_links_add_dest(fz_context *ctx, dvi_links *l, const char *name, fz_point pt);
+void dvi_links_add_glyph(fz_context *ctx, dvi_links *l, fz_rect box);
+
 // Shared data common to DVI interpreter and renderer
 typedef struct
 {
@@ -336,6 +370,9 @@ typedef struct
   // Pdf color stacks (introduced by pdftex)
   dvi_colorstacks pdfcolorstacks;
   float scale;
+
+  // When not NULL, links and destinations are collected here
+  dvi_links *links;
 } dvi_context;
 
 #define DC_ALLOC(ctx, dc, type, count) ((type*)dvi_scratch_alloc(ctx, &(dc)->scratch, sizeof(type) * (count)))

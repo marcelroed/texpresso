@@ -58,6 +58,13 @@ dvi_context_set_device(fz_context *ctx, dvi_context *dc, fz_device *dev)
 
 void dvi_context_free(fz_context *ctx, dvi_context *dc)
 {
+  if (dc->links)
+  {
+    dvi_links_clear(ctx, dc->links);
+    fz_free(ctx, dc->links->links);
+    fz_free(ctx, dc->links->dests);
+    fz_free(ctx, dc->links);
+  }
   dvi_context_set_device(ctx, dc, NULL);
   dvi_resmanager_free(ctx, dc->resmanager);
   dvi_scratch_release(ctx, &dc->scratch);
@@ -79,6 +86,9 @@ void dvi_context_begin_frame(fz_context *ctx, dvi_context *dc, fz_device *dev)
   dc->colorstack.depth = 0;
   for (int i = 0; i < dc->pdfcolorstacks.capacity; i++)
     dc->pdfcolorstacks.stacks[i].depth = 0;
+
+  if (dc->links)
+    dvi_links_clear(ctx, dc->links);
 }
 
 void dvi_context_end_frame(fz_context *ctx, dvi_context *dc)
@@ -124,3 +134,80 @@ bool dvi_state_enter_vf(dvi_context *dc, dvi_state *vfst, const dvi_state *st, d
   return 1;
 }
 
+
+/* Hyperlinks */
+
+void dvi_links_clear(fz_context *ctx, dvi_links *l)
+{
+  fz_free(ctx, l->active);
+  l->active = NULL;
+  for (int i = 0; i < l->link_count; ++i)
+    fz_free(ctx, l->links[i].target);
+  for (int i = 0; i < l->dest_count; ++i)
+    fz_free(ctx, l->dests[i].name);
+  l->link_count = 0;
+  l->dest_count = 0;
+}
+
+static void push_link(fz_context *ctx, dvi_links *l)
+{
+  if (!l->active || fz_is_empty_rect(l->rect))
+    return;
+  if (l->link_count == l->link_cap)
+  {
+    int cap = l->link_cap ? l->link_cap * 2 : 16;
+    l->links = fz_realloc_array(ctx, l->links, cap, dvi_link);
+    l->link_cap = cap;
+  }
+  l->links[l->link_count].rect = l->rect;
+  l->links[l->link_count].target = fz_strdup(ctx, l->active);
+  l->link_count += 1;
+}
+
+void dvi_links_begin(fz_context *ctx, dvi_links *l, const char *target)
+{
+  dvi_links_end(ctx, l);
+  l->active = fz_strdup(ctx, target);
+  l->rect = fz_empty_rect;
+}
+
+void dvi_links_end(fz_context *ctx, dvi_links *l)
+{
+  push_link(ctx, l);
+  fz_free(ctx, l->active);
+  l->active = NULL;
+}
+
+void dvi_links_add_dest(fz_context *ctx, dvi_links *l, const char *name, fz_point pt)
+{
+  if (l->dest_count == l->dest_cap)
+  {
+    int cap = l->dest_cap ? l->dest_cap * 2 : 16;
+    l->dests = fz_realloc_array(ctx, l->dests, cap, dvi_dest);
+    l->dest_cap = cap;
+  }
+  l->dests[l->dest_count].name = fz_strdup(ctx, name);
+  l->dests[l->dest_count].pt = pt;
+  l->dest_count += 1;
+}
+
+void dvi_links_add_glyph(fz_context *ctx, dvi_links *l, fz_rect box)
+{
+  if (!l->active || fz_is_empty_rect(box))
+    return;
+  if (fz_is_empty_rect(l->rect))
+  {
+    l->rect = box;
+    return;
+  }
+  // A glyph that is not on the line of the current rectangle starts a new
+  // one: a link broken across lines is clickable on each piece.
+  float cy = (box.y0 + box.y1) / 2;
+  if (cy < l->rect.y0 || cy > l->rect.y1 || box.x1 < l->rect.x0)
+  {
+    push_link(ctx, l);
+    l->rect = box;
+  }
+  else
+    l->rect = fz_union_rect(l->rect, box);
+}

@@ -63,6 +63,21 @@ static fz_display_list *engine_render_page(txp_engine *_self,
   return dl;
 }
 
+static fz_link *engine_load_links(txp_engine *_self, fz_context *ctx, int page)
+{
+  SELF;
+  return incdvi_load_links(ctx, self->dvi, self->buffer, page);
+}
+
+static bool engine_resolve_link(txp_engine *_self, fz_context *ctx,
+                                const char *uri, int *page, fz_point *pt)
+{
+  SELF;
+  if (uri[0] != '#')
+    return 0;
+  return incdvi_find_dest(ctx, self->dvi, self->buffer, uri + 1, page, pt);
+}
+
 static bool engine_step(txp_engine *_self,
                         fz_context *ctx,
                         bool restart_if_needed)

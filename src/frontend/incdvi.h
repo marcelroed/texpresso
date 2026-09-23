@@ -42,4 +42,10 @@ void incdvi_render_page(fz_context *ctx, incdvi_t *d, fz_buffer *buf, int page, 
 void incdvi_find_page_loc(fz_context *ctx, incdvi_t *d, fz_buffer *buf, int page);
 float incdvi_tex_scale_factor(incdvi_t *d);
 
+// Links of a page, in document space. The target of a link is "#name" for a
+// named destination or an external URI.
+fz_link *incdvi_load_links(fz_context *ctx, incdvi_t *d, fz_buffer *buf, int page);
+bool incdvi_find_dest(fz_context *ctx, incdvi_t *d, fz_buffer *buf,
+                      const char *name, int *page, fz_point *pt);
+
 #endif /*!INCDVI_H*/

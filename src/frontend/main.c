@@ -131,6 +131,18 @@ typedef struct {
     char path[1024];
     int line, column;
   } sync_target;
+
+  // Links of the displayed page
+  fz_link *links;
+  int links_page;
+  bool over_link;
+
+  // Positions left by following links, to go back to
+  struct {
+    int page;
+    fz_point pan;
+  } history[32];
+  int history_len;
 } ui_state;
 
 // The marker is shown at full strength for SYNC_MARK_HOLD_MS, then fades
@@ -568,9 +580,147 @@ static void mouse_position_in_points(int *x, int *y)
   SDL_GetMouseState(x, y);
 }
 
+/* Hyperlinks */
+
+static void display_page(struct persistent_state *ps, ui_state *ui);
+
+// Link of the displayed page under a screen position (in pixels)
+static fz_link *link_at(fz_context *ctx, ui_state *ui, fz_point p)
+{
+  if (ui->links_page != ui->page)
+    return NULL;
+  fz_point pt = txp_renderer_screen_to_document(ctx, ui->doc_renderer, p);
+  for (fz_link *l = ui->links; l; l = l->next)
+    if (fz_is_point_inside_rect(pt, fz_expand_rect(l->rect, 1)))
+      return l;
+  return NULL;
+}
+
+// Show a position of the current page in the upper part of the window and
+// flash the marker there.
+static void show_position(fz_context *ctx, ui_state *ui, fz_point p)
+{
+  ui->sync_mark.active = true;
+  ui->sync_mark.page = ui->page;
+  // p is the top-left corner of the target: put the caret on the first line.
+  ui->sync_mark.pt = fz_make_point(p.x, p.y + 8);
+  ui->sync_mark.box = fz_empty_rect;
+  ui->sync_mark.no_caret = false;
+  ui->sync_mark.ticks = SDL_GetTicks();
+
+  int w, h;
+  txp_renderer_screen_size(ctx, ui->doc_renderer, &w, &h);
+  fz_point sp = txp_renderer_document_to_screen(ctx, ui->doc_renderer, p);
+  txp_renderer_config *config = txp_renderer_get_config(ctx, ui->doc_renderer);
+  config->pan.y += h / 4.0 - sp.y;
+  schedule_event(RENDER_EVENT);
+}
+
+static void go_to(struct persistent_state *ps, ui_state *ui, int page, fz_point pan)
+{
+  if (page != ui->page)
+  {
+    synctex_set_target(send(synctex, ui->eng, NULL), 0, NULL, 0, -1);
+    ui->page = page;
+    display_page(ps, ui);
+  }
+  txp_renderer_get_config(ps->ctx, ui->doc_renderer)->pan = pan;
+  schedule_event(RENDER_EVENT);
+}
+
+static void follow_link(struct persistent_state *ps, ui_state *ui, fz_link *link)
+{
+  fz_context *ctx = ps->ctx;
+  int page = -1;
+  fz_point pt = fz_make_point(0, 0);
+  bool found = false;
+
+  fz_try(ctx)
+    found = send(resolve_link, ui->eng, ctx, link->uri, &page, &pt);
+  fz_catch(ctx)
+    found = false;
+
+  if (!found)
+  {
+    if (fz_is_external_link(ctx, link->uri))
+    {
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+      fprintf(stderr, "[link] opening %s\n", link->uri);
+      if (SDL_OpenURL(link->uri) != 0)
+        fprintf(stderr, "[link] cannot open %s: %s\n", link->uri, SDL_GetError());
+#else
+      fprintf(stderr, "[link] cannot open external links with this SDL: %s\n", link->uri);
+#endif
+    }
+    else
+      fprintf(stderr, "[link] destination not found: %s\n", link->uri);
+    return;
+  }
+
+  if (page < 0 || page >= send(page_count, ui->eng))
+    return;
+  if (isnan(pt.x)) pt.x = 0;
+  if (isnan(pt.y)) pt.y = 0;
+  fprintf(stderr, "[link] %s: page %d, (%.02f, %.02f)\n",
+          link->uri, page, pt.x, pt.y);
+
+  txp_renderer_config *config = txp_renderer_get_config(ctx, ui->doc_renderer);
+  int n = sizeof(ui->history) / sizeof(ui->history[0]);
+  if (ui->history_len == n)
+  {
+    memmove(&ui->history[0], &ui->history[1], sizeof(ui->history[0]) * (n - 1));
+    ui->history_len -= 1;
+  }
+  ui->history[ui->history_len].page = ui->page;
+  ui->history[ui->history_len].pan = config->pan;
+  ui->history_len += 1;
+
+  go_to(ps, ui, page, config->pan);
+  show_position(ctx, ui, pt);
+}
+
+static void go_back(struct persistent_state *ps, ui_state *ui)
+{
+  if (ui->history_len == 0)
+    return;
+  ui->history_len -= 1;
+  int page = ui->history[ui->history_len].page;
+  if (page >= send(page_count, ui->eng))
+    return;
+  go_to(ps, ui, page, ui->history[ui->history_len].pan);
+}
+
+static void update_link_cursor(fz_context *ctx, ui_state *ui, int x, int y)
+{
+  static SDL_Cursor *hand, *arrow;
+  fz_point scale = get_scale_factor(ui->window);
+  bool over = link_at(ctx, ui, fz_make_point(scale.x * x, scale.y * y)) != NULL;
+  if (over == ui->over_link)
+    return;
+  ui->over_link = over;
+  if (!hand)
+  {
+    hand = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_HAND);
+    arrow = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_ARROW);
+  }
+  SDL_SetCursor(over ? hand : arrow);
+}
+
 static void ui_mouse_down(struct persistent_state *ps, ui_state *ui, int x, int y, bool ctrl)
 {
-  if (ctrl)
+  fz_point link_pos = get_scale_factor(ui->window);
+  link_pos.x *= x;
+  link_pos.y *= y;
+  fz_link *link = ctrl ? NULL : link_at(ps->ctx, ui, link_pos);
+  if (link)
+  {
+    // Following a link replaces selection and backward sync
+    ui->mouse_status = UI_MOUSE_NONE;
+    follow_link(ps, ui, link);
+    // The link list may have been replaced by the new page's
+    update_link_cursor(ps->ctx, ui, x, y);
+  }
+  else if (ctrl)
     ui->mouse_status = UI_MOUSE_MOVE;
   else
   {
@@ -628,6 +778,7 @@ static void ui_mouse_move(fz_context *ctx, ui_state *ui, int x, int y)
   switch (ui->mouse_status)
   {
     case UI_MOUSE_NONE:
+      update_link_cursor(ctx, ui, x, y);
       break;
 
     case UI_MOUSE_SELECT:
@@ -1265,6 +1416,18 @@ static void display_page(struct persistent_state *ps, ui_state *ui)
   fz_display_list *dl = send(render_page, ui->eng, ps->ctx, ui->page);
   txp_renderer_set_contents(ps->ctx, ui->doc_renderer, dl);
   fz_drop_display_list(ps->ctx, dl);
+
+  fz_drop_link(ps->ctx, ui->links);
+  ui->links = NULL;
+  ui->links_page = ui->page;
+  fz_try(ps->ctx)
+    ui->links = send(load_links, ui->eng, ps->ctx, ui->page);
+  fz_catch(ps->ctx)
+  {
+    fprintf(stderr, "[link] cannot load links: %s\n", fz_caught_message(ps->ctx));
+    ui->links_page = -1;
+  }
+
   schedule_event(RENDER_EVENT);
 }
 
@@ -1526,6 +1689,10 @@ bool texpresso_main(struct persistent_state *ps)
   ui_state raw_ui, *ui = &raw_ui;
 
   ui->window = ps->window;
+  ui->links = NULL;
+  ui->links_page = -1;
+  ui->over_link = false;
+  ui->history_len = 0;
 
   bool using_texlive = 0;
 
@@ -1966,6 +2133,11 @@ bool texpresso_main(struct persistent_state *ps)
             SDL_SetWindowFullscreen(ui->window, 0);
             break;
 
+          // Return to where a link was followed from
+          case SDLK_BACKSPACE:
+            go_back(ps, ui);
+            break;
+
           // Toggle Fullscreen
           case SDLK_f:
           case SDLK_F5:
@@ -2115,6 +2287,7 @@ bool texpresso_main(struct persistent_state *ps)
   if (ps->initial.display_list)
     fz_keep_display_list(ps->ctx, ps->initial.display_list);
 
+  fz_drop_link(ps->ctx, ui->links);
   txp_renderer_free(ps->ctx, ui->doc_renderer);
   send(destroy, ui->eng, ps->ctx);
 

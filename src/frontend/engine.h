@@ -69,6 +69,11 @@ struct txp_engine_class
   bool (*end_changes)(txp_engine *self, fz_context *ctx);
   int (*page_count)(txp_engine *self);
   fz_display_list *(*render_page)(txp_engine *self, fz_context *ctx, int page);
+  // Links of a page, in document space. Internal links have a target
+  // understood by resolve_link.
+  fz_link *(*load_links)(txp_engine *self, fz_context *ctx, int page);
+  bool (*resolve_link)(txp_engine *self, fz_context *ctx, const char *uri,
+                       int *page, fz_point *pt);
   txp_engine_status (*get_status)(txp_engine *self);
   float (*scale_factor)(txp_engine *self);
   synctex_t *(*synctex)(txp_engine *self, fz_buffer **buf);
@@ -90,6 +95,11 @@ struct txp_engine_class
   static void engine_detect_changes(txp_engine *_self, fz_context *ctx);    \
   static bool engine_end_changes(txp_engine *_self, fz_context *ctx);       \
   static int engine_page_count(txp_engine *_self);                          \
+  static fz_link *engine_load_links(txp_engine *_self, fz_context *ctx,     \
+                                    int page);                              \
+  static bool engine_resolve_link(txp_engine *_self, fz_context *ctx,       \
+                                  const char *uri, int *page,               \
+                                  fz_point *pt);                            \
   static txp_engine_status engine_get_status(txp_engine *_self);            \
   static float engine_scale_factor(txp_engine *_self);                      \
   static synctex_t *engine_synctex(txp_engine *_self, fz_buffer **buf);     \
@@ -108,6 +118,8 @@ struct txp_engine_class
       .step = engine_step,                                                  \
       .page_count = engine_page_count,                                      \
       .render_page = engine_render_page,                                    \
+      .load_links = engine_load_links,                                      \
+      .resolve_link = engine_resolve_link,                                  \
       .get_status = engine_get_status,                                      \
       .scale_factor = engine_scale_factor,                                  \
       .synctex = engine_synctex,                                            \

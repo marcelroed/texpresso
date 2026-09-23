@@ -59,6 +59,35 @@ static fz_display_list *engine_render_page(txp_engine *_self,
   return dl;
 }
 
+static fz_link *engine_load_links(txp_engine *_self, fz_context *ctx, int index)
+{
+  SELF;
+  fz_page *page = fz_load_page(ctx, self->doc, index);
+  fz_link *links = NULL;
+  fz_try(ctx)
+    links = fz_load_links(ctx, page);
+  fz_always(ctx)
+    fz_drop_page(ctx, page);
+  fz_catch(ctx)
+    fz_rethrow(ctx);
+  return links;
+}
+
+static bool engine_resolve_link(txp_engine *_self, fz_context *ctx,
+                                const char *uri, int *page, fz_point *pt)
+{
+  SELF;
+  if (fz_is_external_link(ctx, uri))
+    return 0;
+  fz_link_dest dest = fz_resolve_link_dest(ctx, self->doc, uri);
+  int index = fz_page_number_from_location(ctx, self->doc, dest.loc);
+  if (index < 0)
+    return 0;
+  *page = index;
+  *pt = fz_make_point(dest.x, dest.y);
+  return 1;
+}
+
 static bool engine_step(txp_engine *_self,
                         fz_context *ctx,
                         bool restart_if_needed)
