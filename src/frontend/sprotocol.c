@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -89,6 +90,8 @@ static ssize_t read_(channel_t *t, int fd, void *data, size_t len)
       abort();
       //close(t->passed_fd);
     t->passed_fd = fds0[0];
+    // Not inherited by engines started later (see exec_xelatex)
+    fcntl(t->passed_fd, F_SETFD, FD_CLOEXEC);
   }
 
   return recvd;

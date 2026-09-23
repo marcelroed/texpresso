@@ -186,6 +186,9 @@ static pid_t exec_xelatex_generic(char **args, int *fd)
   /* PARENT */
   if (close(sockets[1]) != 0)
     mabort();
+  // Engines started later must not inherit this end: a process holding it
+  // keeps the engine from seeing TeXpresso exit.
+  fcntl(sockets[0], F_SETFD, FD_CLOEXEC);
   *fd = sockets[0];
   return pid;
 }

@@ -68,13 +68,20 @@ pid_t texpresso_fork_with_channel(int fd, uint32_t time)
 
   if (child == 0)
   {
-    // In child: replace channel with new socket
+    // In child: replace channel with new socket, release temporary ones
     PERROR(dup2(sockets[1], fd));
+    PERROR(close(sockets[0]));
+    PERROR(close(sockets[1]));
   }
   else
   {
     // In parent: send other end of new socket to driver
     send_child_fd(fd, child, time, sockets[0]);
+
+    // Release the new socket before waiting: while this process holds the
+    // driver's end, the child cannot see the driver exit and never ends.
+    PERROR(close(sockets[0]));
+    PERROR(close(sockets[1]));
 
     // Wait for process to end
     int status;
@@ -92,6 +99,10 @@ pid_t texpresso_fork_with_channel(int fd, uint32_t time)
     do {
       NO_EINTR(recvd = read(fd, answer, 4));
 
+      // The driver is gone: nothing left to resume.
+      if (recvd == 0)
+        _exit(0);
+
       // Ignore any flush message, the buffers have been flushed
       // anyway before starting the fork.
     } while (recvd == 4 &&
@@ -105,10 +116,6 @@ pid_t texpresso_fork_with_channel(int fd, uint32_t time)
             recvd,
             answer[0], answer[1], answer[2], answer[3]);
   }
-  PERROR(close(sockets[0]));
-
-  // Release temporary socket
-  PERROR(close(sockets[1]));
 
   return child;
 }

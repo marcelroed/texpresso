@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 #include "mydvi.h"
 #include "providers.h"
 #include "renderer.h"
@@ -852,6 +853,27 @@ static void ui_mouse_wheel(fz_context *ctx, ui_state *ui, float dx, float dy, in
 
 /* Stdin polling */
 
+// Write end of the poll thread pipe, for the termination signal handler.
+static volatile int quit_signal_fd = -1;
+
+// SDL turns SIGTERM into a quit event only when it next pumps events, and on
+// macOS waiting for events does not return on a signal: stopping TeXpresso
+// from an editor took until something else woke the window up. Wake the poll
+// thread instead, which posts the quit event.
+static void signal_quit(int sig)
+{
+  (void)sig;
+  int fd = quit_signal_fd;
+  if (fd != -1)
+  {
+    int saved_errno = errno;
+    char c = 't';
+    (void)!write(fd, &c, 1);
+    errno = saved_errno;
+  }
+  // Otherwise TeXpresso is already quitting
+}
+
 static int SDLCALL poll_stdin_thread_main(void *data)
 {
   int *pipes = data;
@@ -873,6 +895,15 @@ static int SDLCALL poll_stdin_thread_main(void *data)
 
     if (c == 'q')
       return 0;
+
+    if (c == 't')
+    {
+      SDL_Event quit;
+      SDL_zero(quit);
+      quit.type = SDL_QUIT;
+      SDL_PushEvent(&quit);
+      continue;
+    }
 
     if (c != 'c')
       abort();
@@ -1801,6 +1832,11 @@ bool texpresso_main(struct persistent_state *ps)
 
   SDL_Thread *poll_stdin_thread =
     SDL_CreateThread(poll_stdin_thread_main, "poll_stdin_thread", poll_stdin_pipe);
+
+  quit_signal_fd = poll_stdin_pipe[1];
+  signal(SIGTERM, signal_quit);
+  signal(SIGINT, signal_quit);
+  signal(SIGHUP, signal_quit);
   bool stdin_eof = 0;
   int rerun_count = 0;
 
@@ -2268,6 +2304,7 @@ bool texpresso_main(struct persistent_state *ps)
 
   {
     int status = 0;
+    quit_signal_fd = -1;
     wakeup_poll_thread(poll_stdin_pipe, 'q');
     SDL_WaitThread(poll_stdin_thread, &status);
     close(poll_stdin_pipe[0]);
