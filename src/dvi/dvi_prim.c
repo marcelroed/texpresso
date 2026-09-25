@@ -112,29 +112,47 @@ void dvi_exec_char(fz_context *ctx, dvi_context *dc, dvi_state *st, uint32_t c, 
     }
     if (font->fz)
     {
-      int u = -1;
+      // Glyph and character for the code c. The character comes from the
+      // glyph name (the font encoding's, else the font's own): TeX fonts
+      // put ligatures, quotes and dashes at arbitrary codes.
+      int u = -1, uni = c;
       if (c >= 0 && c <= 255)
       {
+        // Glyphs at [0, 256), characters at [256, 512)
         if (font->glyph_map)
+        {
           u = font->glyph_map[c];
+          uni = font->glyph_map[256 + c];
+        }
         else
         {
-          int *buf = fz_malloc_array(ctx, 256, int);
+          int *buf = fz_malloc_array(ctx, 512, int);
           if (!buf) abort();
-          for (int i = 0; i < 256; ++i) buf[i] = -1;
+          for (int i = 0; i < 512; ++i) buf[i] = -1;
           font->glyph_map = buf;
         }
 
         if (u == -1)
         {
           const char *name = NULL;
+          char buf[64];
           if (font->enc)
             name = tex_enc_get(font->enc, c);
           if (name)
             u = fz_encode_character_by_glyph_name(ctx, font->fz, (const char *)name);
           else
+          {
             u = fz_encode_character(ctx, font->fz, c);
+            buf[0] = 0;
+            if (u > 0)
+              fz_get_glyph_name(ctx, font->fz, u, buf, sizeof(buf));
+            name = buf;
+          }
+          uni = name[0] ? fz_unicode_from_glyph_name(name) : 0;
+          if (uni <= 0 || uni == 0xFFFD)
+            uni = c;
           font->glyph_map[c] = u;
+          font->glyph_map[256 + c] = uni;
         }
       }
       else
@@ -146,7 +164,7 @@ void dvi_exec_char(fz_context *ctx, dvi_context *dc, dvi_state *st, uint32_t c, 
       float s = dc->scale * scale_factor.value;
       fz_matrix trm = fz_pre_scale(dvi_get_ctm(dc, st), s, s);
       if (dc->dev)
-        fz_show_glyph(ctx, get_text(ctx, dc), font->fz, trm, u, c, 0, 0,
+        fz_show_glyph(ctx, get_text(ctx, dc), font->fz, trm, u, uni, 0, 0,
                       FZ_BIDI_LTR, FZ_LANG_UNSET);
       link_glyph(ctx, dc, font->fz, u, trm);
     }
@@ -325,7 +343,9 @@ void dvi_exec_xdvfontdef(fz_context *ctx, dvi_context *dc, dvi_state *st, uint32
   if (def)
   {
     def->kind = XDV_FONT;
-    def->xdv_font.font = dvi_resmanager_get_xdv_font(ctx, dc->resmanager, name, name_len, index);
+    def->xdv_font.font = dvi_resmanager_get_xdv_font(ctx, dc->resmanager, name, name_len, index,
+                                                     &def->xdv_font.unicode,
+                                                     &def->xdv_font.glyph_count);
     def->xdv_font.spec = spec;
   }
 }
@@ -359,8 +379,10 @@ void dvi_exec_xdvglyphs(fz_context *ctx, dvi_context *dc, dvi_state *st, fixed_t
       int32_t v = dy ? sv + dy[i].value : sv;
       fz_matrix ctm =
           fz_pre_scale(fz_pre_translate(st->gs.ctm, h * ds, -v * ds), fs, fs);
+      int uni = glyphs[i] < def->xdv_font.glyph_count
+                    ? def->xdv_font.unicode[glyphs[i]] : 0;
       if (text)
-        fz_show_glyph(ctx, text, font, ctm, glyphs[i], 0, 0, 0, FZ_BIDI_LTR,
+        fz_show_glyph(ctx, text, font, ctm, glyphs[i], uni, 0, 0, FZ_BIDI_LTR,
                       FZ_LANG_UNSET);
       if (linking)
         link_glyph(ctx, dc, font, glyphs[i], ctm);

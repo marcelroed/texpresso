@@ -54,6 +54,9 @@ struct cell_fz_font {
   const char *name;
   int index;
   fz_font *font;
+  // For XDV fonts, the character of each glyph (see glyph_unicode)
+  int *unicode;
+  int glyph_count;
   cell_fz_font *next;
 };
 
@@ -479,6 +482,7 @@ void dvi_resmanager_free(fz_context *ctx, dvi_resmanager *rm)
     fz_free(ctx, (void*)cell->name);
     if (cell->font)
       fz_drop_font(ctx, cell->font);
+    fz_free(ctx, cell->unicode);
     fz_free(ctx, cell);
     cell = next;
   }
@@ -536,14 +540,14 @@ static tex_enc *dvi_resmanager_get_tex_enc(fz_context *ctx, dvi_resmanager *rm, 
   return cell->enc;
 }
 
-static fz_font *dvi_resmanager_get_fz_font(fz_context *ctx, dvi_resmanager *rm, const char *name, int len, int index)
+static cell_fz_font *dvi_resmanager_get_fz_font_cell(fz_context *ctx, dvi_resmanager *rm, const char *name, int len, int index)
 {
   for (cell_fz_font *cell = rm->first_fz_font; cell; cell = cell->next)
   {
     if (strncmp(name, cell->name, len) == 0 &&
         cell->name[len] == 0 &&
         cell->index == index)
-      return cell->font;
+      return cell;
   }
 
   fz_ptr(cell_fz_font, cell);
@@ -601,7 +605,66 @@ static fz_font *dvi_resmanager_get_fz_font(fz_context *ctx, dvi_resmanager *rm, 
   }
   rm->first_fz_font = cell;
 
-  return cell->font;
+  return cell;
+}
+
+static fz_font *dvi_resmanager_get_fz_font(fz_context *ctx, dvi_resmanager *rm, const char *name, int len, int index)
+{
+  return dvi_resmanager_get_fz_font_cell(ctx, rm, name, len, index)->font;
+}
+
+// XDV glyphs come without their characters: find the character of each
+// glyph of the font in its Unicode character map, else from the name of the
+// glyph (ligatures such as f_i, variants such as a.sc).
+static int *glyph_unicode(fz_context *ctx, fz_font *font, int *glyph_count)
+{
+  FT_Face face = fz_font_ft_face(ctx, font);
+  if (!face || face->num_glyphs <= 0)
+    return NULL;
+  int count = face->num_glyphs;
+  int *unicode = fz_malloc_array(ctx, count, int);
+  memset(unicode, 0, count * sizeof(int));
+
+  FT_CharMap charmap = face->charmap;
+  for (int i = 0; i < face->num_charmaps; i++)
+  {
+    if (face->charmaps[i]->encoding != FT_ENCODING_UNICODE ||
+        FT_Set_Charmap(face, face->charmaps[i]) != 0)
+      continue;
+    FT_UInt glyph;
+    // The smallest character of a glyph: ASCII rather than a variant
+    for (FT_ULong c = FT_Get_First_Char(face, &glyph); glyph != 0;
+         c = FT_Get_Next_Char(face, c, &glyph))
+      if (glyph < (FT_UInt)count && unicode[glyph] == 0)
+        unicode[glyph] = c;
+    break;
+  }
+  if (charmap)
+    FT_Set_Charmap(face, charmap);
+
+  static const struct { const char *name; int unicode; } ligatures[] = {
+    {"f_f", 0xFB00}, {"f_i", 0xFB01}, {"f_l", 0xFB02}, {"f_f_i", 0xFB03},
+    {"f_f_l", 0xFB04}, {"s_t", 0xFB06},
+  };
+  for (int g = 0; g < count; g++)
+  {
+    if (unicode[g])
+      continue;
+    char name[64];
+    fz_get_glyph_name(ctx, font, g, name, sizeof(name));
+    // Drop the suffix of a variant: a.sc, one.oldstyle
+    char *dot = strchr(name, '.');
+    if (dot && dot > name)
+      *dot = 0;
+    int u = name[0] ? fz_unicode_from_glyph_name(name) : 0;
+    for (size_t i = 0; !u && i < sizeof(ligatures) / sizeof(*ligatures); i++)
+      if (strcmp(name, ligatures[i].name) == 0)
+        u = ligatures[i].unicode;
+    unicode[g] = u == 0xFFFD ? 0 : u;
+  }
+
+  *glyph_count = count;
+  return unicode;
 }
 
 dvi_font *dvi_resmanager_get_tex_font(fz_context *ctx, dvi_resmanager *rm, const char *name, int len)
@@ -690,9 +753,15 @@ dvi_font *dvi_resmanager_get_tex_font(fz_context *ctx, dvi_resmanager *rm, const
   return &cell->font;
 }
 
-fz_font *dvi_resmanager_get_xdv_font(fz_context *ctx, dvi_resmanager *rm, const char *name, int len, int index)
+fz_font *dvi_resmanager_get_xdv_font(fz_context *ctx, dvi_resmanager *rm, const char *name, int len, int index,
+                                     const int **unicode, int *glyph_count)
 {
-  return dvi_resmanager_get_fz_font(ctx, rm, name, len, index);
+  cell_fz_font *cell = dvi_resmanager_get_fz_font_cell(ctx, rm, name, len, index);
+  if (cell->font && !cell->unicode)
+    cell->unicode = glyph_unicode(ctx, cell->font, &cell->glyph_count);
+  *unicode = cell->unicode;
+  *glyph_count = cell->unicode ? cell->glyph_count : 0;
+  return cell->font;
 }
 
 void dvi_resmanager_invalidate(fz_context *ctx, dvi_resmanager *rm, dvi_reskind kind, const char *name)
@@ -750,6 +819,7 @@ void dvi_resmanager_invalidate(fz_context *ctx, dvi_resmanager *rm, dvi_reskind 
         fz_free(ctx, (void*)(*cell)->name);
         if ((*cell)->font)
           fz_drop_font(ctx, (*cell)->font);
+        fz_free(ctx, (*cell)->unicode);
         cell_fz_font *next = (*cell)->next;
         fz_free(ctx, *cell);
         *cell = next;

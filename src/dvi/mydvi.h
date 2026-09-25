@@ -162,6 +162,9 @@ typedef struct
     struct {
       fz_font *font;
       dvi_xdvfontspec spec;
+      // The character of each glyph (0 if unknown), for text extraction
+      const int *unicode;
+      int glyph_count;
     } xdv_font;
   };
 } dvi_fontdef;
@@ -209,7 +212,8 @@ void dvi_free_hooks(fz_context *ctx, const dvi_reshooks *hooks);
 dvi_resmanager *dvi_resmanager_new(fz_context *ctx, dvi_reshooks hooks);
 void dvi_resmanager_free(fz_context *ctx, dvi_resmanager *rm);
 dvi_font *dvi_resmanager_get_tex_font(fz_context *ctx, dvi_resmanager *rm, const char *name, int namelen);
-fz_font *dvi_resmanager_get_xdv_font(fz_context *ctx, dvi_resmanager *rm, const char *name, int namelen, int index);
+fz_font *dvi_resmanager_get_xdv_font(fz_context *ctx, dvi_resmanager *rm, const char *name, int namelen, int index,
+                                     const int **unicode, int *glyph_count);
 pdf_document *dvi_resmanager_get_pdf(fz_context *ctx, dvi_resmanager *rm, const char *filename);
 fz_image *dvi_resmanager_get_img(fz_context *ctx, dvi_resmanager *rm, const char *filename);
 void dvi_resmanager_invalidate(fz_context *ctx, dvi_resmanager *rm, dvi_reskind kind, const char *name);
