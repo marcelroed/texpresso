@@ -84,6 +84,60 @@ static void link_glyph(fz_context *ctx, dvi_context *dc, fz_font *font, int gid,
   dvi_links_add_glyph(ctx, dc->links, box);
 }
 
+// Characters of glyph names of TeX fonts that the Adobe list lacks: the
+// variant letters of cmmi ("epsilon1") and the sized variants of the
+// extension fonts ("summationdisplay", "parenleftBig", "radicalbigg").
+// Extensible pieces ("bracelefttp", "bracehtipdownleft") are left out.
+static int tex_glyph_unicode(const char *name)
+{
+  static const struct { const char *prefix; int unicode; } table[] = {
+    {"summation", 0x2211}, {"product", 0x220F}, {"coproduct", 0x2210},
+    {"integral", 0x222B}, {"contintegral", 0x222E},
+    {"union", 0x22C3}, {"intersection", 0x22C2},
+    {"unionsq", 0x2A06}, {"unionmulti", 0x2A04},
+    {"logicaland", 0x22C0}, {"logicalor", 0x22C1},
+    {"circledot", 0x2A00}, {"circleplus", 0x2A01}, {"circlemultiply", 0x2A02},
+    {"radical", 0x221A},
+    {"angbracketleft", 0x27E8}, {"angbracketright", 0x27E9},
+    {"floorleft", 0x230A}, {"floorright", 0x230B},
+    {"ceilingleft", 0x2308}, {"ceilingright", 0x2309},
+  };
+  static const struct { const char *prefix; int unicode; } delims[] = {
+    {"parenleft", '('}, {"parenright", ')'},
+    {"bracketleft", '['}, {"bracketright", ']'},
+    {"braceleft", '{'}, {"braceright", '}'},
+    {"slash", '/'}, {"backslash", '\\'},
+  };
+  static const char *sizes[] = {"", "big", "Big", "bigg", "Bigg", "text", "display"};
+  // Variant letters of cmmi
+  static const struct { const char *name; int unicode; } letters[] = {
+    {"epsilon1", 0x3B5}, {"theta1", 0x3D1}, {"pi1", 0x3D6}, {"rho1", 0x3F1},
+    {"sigma1", 0x3C2}, {"phi1", 0x3C6}, {"ell", 0x2113},
+  };
+
+  for (size_t i = 0; i < sizeof(letters) / sizeof(letters[0]); ++i)
+    if (strcmp(name, letters[i].name) == 0)
+      return letters[i].unicode;
+
+  for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); ++i)
+  {
+    size_t n = strlen(table[i].prefix);
+    if (strncmp(name, table[i].prefix, n) == 0)
+      for (size_t j = 0; j < sizeof(sizes) / sizeof(sizes[0]); ++j)
+        if (strcmp(name + n, sizes[j]) == 0)
+          return table[i].unicode;
+  }
+  for (size_t i = 0; i < sizeof(delims) / sizeof(delims[0]); ++i)
+  {
+    size_t n = strlen(delims[i].prefix);
+    if (strncmp(name, delims[i].prefix, n) == 0)
+      for (size_t j = 1; j < 5; ++j)
+        if (strcmp(name + n, sizes[j]) == 0)
+          return delims[i].unicode;
+  }
+  return 0;
+}
+
 static dvi_fontdef *dvi_current_font(fz_context *ctx, dvi_state *st)
 {
   return dvi_fonttable_get(ctx, st->fonts, st->f);
@@ -148,9 +202,18 @@ void dvi_exec_char(fz_context *ctx, dvi_context *dc, dvi_state *st, uint32_t c, 
               fz_get_glyph_name(ctx, font->fz, u, buf, sizeof(buf));
             name = buf;
           }
-          uni = name[0] ? fz_unicode_from_glyph_name(name) : 0;
-          if (uni <= 0 || uni == 0xFFFD)
+          // An unknown name is a symbol, not the character at code c
+          // (cmex has the summation sign at 'X').
+          if (!name[0])
             uni = c;
+          else
+          {
+            uni = fz_unicode_from_glyph_name(name);
+            if (uni <= 0 || uni == 0xFFFD)
+              uni = tex_glyph_unicode(name);
+            if (uni <= 0)
+              uni = 0xFFFD;
+          }
           font->glyph_map[c] = u;
           font->glyph_map[256 + c] = uni;
         }

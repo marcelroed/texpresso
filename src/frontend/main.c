@@ -255,9 +255,23 @@ enum sync_segment_kind {
   SYNC_SEGMENT_NODE,       // node {...} in a TikZ picture
 };
 
+// Delimiters of math, see sync_math_line
+enum sync_math_kind {
+  SYNC_MATH_NONE,
+  SYNC_MATH_DOLLAR,     // $...$
+  SYNC_MATH_DOLLARS,    // $$...$$
+  SYNC_MATH_PAREN,      // \(...\)
+  SYNC_MATH_BRACKET,    // \[...\]
+  SYNC_MATH_ENV,        // \begin{align}...\end{align}
+};
+
+struct sync_macros;
+
 struct sync_text {
   int chars[SYNC_TEXT_MAX];     // folded characters of all words
-  int source[SYNC_TEXT_MAX];    // their index in the line
+  // The characters of the line each one stands for, [source, source_end):
+  // itself, or the use of the macro that typeset it
+  int source[SYNC_TEXT_MAX], source_end[SYNC_TEXT_MAX];
   // Whether material left out (math, macros and their arguments) comes
   // right before the character: the page can have more text there, up to
   // this many characters (0 if none).
@@ -276,6 +290,14 @@ struct sync_text {
   // text is typeset at all (not for comment)
   char verbatim[32];
   bool hidden;
+  // The math the lines are in, if any, with the name of its environment
+  enum sync_math_kind math;
+  char math_env[32];
+  // Math left out at the end of the last line (the number of an equation
+  // or of a row): the gap before the next character
+  int pending_gap;
+  // Macros of the document, expanded in math (not reset)
+  const struct sync_macros *macros;
 };
 
 static void sync_text_reset(struct sync_text *t)
@@ -284,19 +306,23 @@ static void sync_text_reset(struct sync_text *t)
   t->depth = t->nsegments = t->open = t->tikz = 0;
   t->node = false;
   t->verbatim[0] = 0;
+  t->math = SYNC_MATH_NONE;
+  t->math_env[0] = 0;
+  t->pending_gap = 0;
 }
 
-// Append the folded character f, line[i], to the word being read (if
-// *in_word) or to a new one.
-static void sync_add_char(struct sync_text *t, bool *in_word, int i, int f,
-                          int gap)
+// Append the folded character f, standing for [start, end) of the line, to
+// the word being read (if *in_word) or to a new one.
+static void sync_add_char(struct sync_text *t, bool *in_word, int start,
+                          int end, int f, int gap)
 {
   if (t->nchars == SYNC_TEXT_MAX || (!*in_word && t->nwords == SYNC_TEXT_MAX))
     return;
   if (!*in_word)
   {
     struct sync_word *w = &t->words[t->nwords++];
-    w->start = i;
+    w->start = start;
+    w->end = end;
     w->first = t->nchars;
     w->count = 0;
     w->segment = t->nsegments ? t->segment[t->nsegments - 1] : 0;
@@ -304,11 +330,15 @@ static void sync_add_char(struct sync_text *t, bool *in_word, int i, int f,
   }
   struct sync_word *w = &t->words[t->nwords - 1];
   t->chars[t->nchars] = f;
-  t->source[t->nchars] = i;
+  t->source[t->nchars] = start;
+  t->source_end[t->nchars] = end;
   t->gap[t->nchars] = gap;
   t->nchars++;
   w->count++;
-  w->end = i + 1;
+  if (start < w->start)
+    w->start = start;
+  if (end > w->end)
+    w->end = end;
 }
 
 // Whether line[i] starts the string s.
@@ -349,7 +379,7 @@ static int sync_verbatim(const int *line, int n, int i, const char *end,
     }
     int f = hidden ? 0 : txp_fold_char(line[i]);
     if (f)
-      sync_add_char(t, &in_word, i, f, 0);
+      sync_add_char(t, &in_word, i, i + 1, f, 0);
     else
       in_word = false;
   }
@@ -414,7 +444,8 @@ static bool sync_env_skips_arguments(const char *env)
   static const char *names[] = {
     "tabular", "tabular*", "tabularx", "tabulary", "array", "longtable",
     "minipage", "wrapfigure", "wraptable", "multicols", "multicols*",
-    "minted", "thebibliography", "subfigure", "list", "tikzpicture", NULL
+    "minted", "thebibliography", "subfigure", "list", "tikzpicture",
+    "alignat", "alignat*", NULL
   };
   for (const char **n = names; *n; n++)
     if (strcmp(*n, env) == 0)
@@ -477,14 +508,1120 @@ static int sync_skip_group(const int *line, int n, int i, int open, int close)
   return n;
 }
 
+// The contents of a file of the document, as the editor last sent it.
+static fz_buffer *sync_file_data(struct persistent_state *ps, ui_state *ui,
+                                 const char *path)
+{
+  fileentry_t *e = send(find_file, ui->eng, ps->ctx, path);
+  return e ? (e->edit_data ? e->edit_data : e->fs_data) : NULL;
+}
+
+/* Math. A formula is read as TeX typesets it, to get its letters and digits
+   in the order of the page: the nucleus of an atom, then its superscript,
+   then its subscript (TeX outputs the superscript first; that of an
+   operator with limits comes before the operator), the numerator of a
+   fraction before its denominator. The macros of the document are expanded
+   (\newcommand{\Din}{{D_\text{in}}}): the characters of their text stand
+   for the macro use. Symbols split words; macros that are not known leave a
+   gap, which can start anywhere (math has no spaces). */
+
+#define SYNC_MATH_GAP 8
+#define SYNC_NEEDLE_MIN 8
+#define SYNC_MAX_EXPANSIONS 64
+
+// A character of math: its code point and the characters of the line it
+// stands for, [col, end)
+struct sync_tok {
+  int c, col, end;
+};
+
+// A macro of the document: \newcommand{\name}[nargs][default]{body}
+struct sync_macro {
+  char name[32];
+  int nargs;
+  int *def, ndef;  // default of the first argument, NULL if it is mandatory
+  int *body, len;
+};
+
+struct sync_macros {
+  struct sync_macro *items;
+  int count, cap;
+};
+
+// The state of the words while reading math
+struct sync_math {
+  struct sync_text *t;
+  bool *in_word;
+  int *gap;
+  bool display;    // display style: operators take limits
+  int expansions;  // macros expanded (a recursive definition stops)
+};
+
+static bool sync_is_letter(int c)
+{
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '@';
+}
+
+// Add g to the gap before the next character: the largest size, and
+// anywhere if either is.
+static void sync_gap_merge(int *gap, int g)
+{
+  int a = *gap & ~TXP_TEXT_GAP_ANYWHERE, b = g & ~TXP_TEXT_GAP_ANYWHERE;
+  *gap = (a > b ? a : b) | ((*gap | g) & TXP_TEXT_GAP_ANYWHERE);
+}
+
+static void sync_math_emit(struct sync_math *m, int c, int col, int end)
+{
+  int f = txp_fold_char(c);
+  if (!f)
+  {
+    *m->in_word = false;
+    return;
+  }
+  sync_add_char(m->t, m->in_word, col, end, f, *m->gap);
+  *m->gap = 0;
+}
+
+static void sync_math_split(struct sync_math *m)
+{
+  *m->in_word = false;
+}
+
+static const struct sync_macro *sync_macros_find(const struct sync_macros *ms,
+                                                 const char *name)
+{
+  // The last definition wins (\renewcommand)
+  for (int i = ms ? ms->count - 1 : -1; i >= 0; i--)
+    if (strcmp(ms->items[i].name, name) == 0)
+      return &ms->items[i];
+  return NULL;
+}
+
+static int sync_tok_spaces(const struct sync_tok *s, int n, int i)
+{
+  while (i < n && (s[i].c == ' ' || s[i].c == '\t'))
+    i++;
+  return i;
+}
+
+// The name of the control sequence at s[i] (a backslash), returning the
+// index after it.
+static int sync_tok_name(const struct sync_tok *s, int n, int i, char *name,
+                         int size)
+{
+  int j = i + 1, k = 0;
+  if (j < n && !sync_is_letter(s[j].c))
+  {
+    name[k++] = s[j].c < 128 ? s[j].c : '?';
+    name[k] = 0;
+    return j + 1;
+  }
+  for (; j < n && sync_is_letter(s[j].c); j++)
+    if (k < size - 1)
+      name[k++] = s[j].c;
+  name[k] = 0;
+  return j;
+}
+
+// The index of what closes the group opened at s[i], n if it does not.
+static int sync_tok_group_end(const struct sync_tok *s, int n, int i,
+                              int open, int close)
+{
+  int depth = 0;
+  for (; i < n; i++)
+  {
+    if (s[i].c == '\\')
+      i++;
+    else if (s[i].c == open)
+      depth++;
+    else if (s[i].c == close && --depth == 0)
+      return i;
+  }
+  return n;
+}
+
+// The argument at s[i] (after spaces): the contents of a group, or a single
+// token, [*a, *b). Returns the index after it.
+static int sync_tok_arg(const struct sync_tok *s, int n, int i, int *a, int *b)
+{
+  i = sync_tok_spaces(s, n, i);
+  *a = *b = i;
+  if (i >= n)
+    return n;
+  if (s[i].c == '{')
+  {
+    int e = sync_tok_group_end(s, n, i, '{', '}');
+    *a = i + 1;
+    *b = e;
+    return e < n ? e + 1 : n;
+  }
+  char name[32];
+  *b = s[i].c == '\\' ? sync_tok_name(s, n, i, name, sizeof(name)) : i + 1;
+  return *b;
+}
+
+// The optional argument at s[i] (after spaces), [*a, *b), with the index
+// after it. Without one, *a = -1 and i is returned.
+static int sync_tok_optional(const struct sync_tok *s, int n, int i, int *a,
+                             int *b)
+{
+  int j = sync_tok_spaces(s, n, i);
+  *a = *b = -1;
+  if (j >= n || s[j].c != '[')
+    return i;
+  int e = sync_tok_group_end(s, n, j, '[', ']');
+  *a = j + 1;
+  *b = e;
+  return e < n ? e + 1 : n;
+}
+
+// The use of macro d at s[i], whose name ends at j, replaced by its text:
+// the tokens of the text (standing for the use) with the arguments (as they
+// are), then those after the use. NULL if too long.
+static struct sync_tok *sync_expand(const struct sync_macro *d,
+                                    const struct sync_tok *s, int n, int i,
+                                    int j, int *len)
+{
+  int a[9], b[9], k = 0;
+  if (d->def)
+  {
+    j = sync_tok_optional(s, n, j, &a[0], &b[0]);
+    k = 1;
+  }
+  for (; k < d->nargs && k < 9; k++)
+    j = sync_tok_arg(s, n, j, &a[k], &b[k]);
+  int col = s[i].col, end = s[j > i ? j - 1 : i].end;
+
+  int size = n - j;
+  for (int p = 0; p < d->len; p++)
+  {
+    int q = p + 1 < d->len ? d->body[p + 1] - '1' : -1;
+    if (d->body[p] == '#' && q >= 0 && q < d->nargs && q < 9)
+    {
+      size += a[q] >= 0 ? b[q] - a[q] : d->ndef;
+      p++;
+    }
+    else
+      size++;
+  }
+  if (size > SYNC_TEXT_MAX)
+    return NULL;
+
+  struct sync_tok *out = malloc(size * sizeof(*out));
+  if (!out)
+    return NULL;
+  int o = 0;
+  for (int p = 0; p < d->len; p++)
+  {
+    int q = p + 1 < d->len ? d->body[p + 1] - '1' : -1;
+    if (d->body[p] == '#' && q >= 0 && q < d->nargs && q < 9)
+    {
+      if (a[q] >= 0)
+        for (int r = a[q]; r < b[q]; r++)
+          out[o++] = s[r];
+      else
+        for (int r = 0; r < d->ndef; r++)
+          out[o++] = (struct sync_tok){d->def[r], col, end};
+      p++;
+    }
+    else
+      out[o++] = (struct sync_tok){d->body[p], col, end};
+  }
+  memcpy(out + o, s + j, (n - j) * sizeof(*out));
+  *len = size;
+  return out;
+}
+
+enum sync_math_macro_kind {
+  SYNC_MM_UNKNOWN,
+  SYNC_MM_SYMBOL,     // a symbol or a space: splits words
+  SYNC_MM_IGNORE,     // typesets nothing (\displaystyle, \left, \limits)
+  SYNC_MM_LETTER,     // a letter (\alpha, \ell)
+  SYNC_MM_NAME,       // its name upright (\sin, \log), or "mod"
+  SYNC_MM_STYLE,      // the math of its argument (\mathbf{x}, \hat{x})
+  SYNC_MM_TEXT,       // the text of its argument (\text{if})
+  SYNC_MM_SKIP,       // not its argument (\label{...}, \phantom{...})
+  SYNC_MM_REFERENCE,  // text not in the source (\eqref{...}, \tag{...})
+  SYNC_MM_DIMEN,      // not the dimension after it (\mkern-9mu)
+  SYNC_MM_FRACTION,   // its two arguments, the first above (\frac)
+  SYNC_MM_UNDERSET,   // its two arguments, the second above
+  SYNC_MM_COLOR,      // the math of its second argument (\textcolor)
+  SYNC_MM_ROOT,       // \sqrt[index]{math}
+  SYNC_MM_ARROW,      // \xrightarrow[below]{above}
+  SYNC_MM_ENV,        // \begin{cases}, \end{cases}
+  SYNC_MM_MOD,        // \pmod{x}: "mod" and its argument
+};
+
+static const struct {
+  const char *name;
+  unsigned char kind;
+  int value;
+} sync_math_macros[] = {
+#define L(n, v) {n, SYNC_MM_LETTER, v}
+  L("alpha", 0x3B1), L("beta", 0x3B2), L("gamma", 0x3B3), L("delta", 0x3B4),
+  L("epsilon", 0x3F5), L("varepsilon", 0x3B5), L("zeta", 0x3B6),
+  L("eta", 0x3B7), L("theta", 0x3B8), L("vartheta", 0x3D1), L("iota", 0x3B9),
+  L("kappa", 0x3BA), L("varkappa", 0x3F0), L("lambda", 0x3BB), L("mu", 0x3BC),
+  L("nu", 0x3BD), L("xi", 0x3BE), L("pi", 0x3C0), L("varpi", 0x3D6),
+  L("rho", 0x3C1), L("varrho", 0x3F1), L("sigma", 0x3C3),
+  L("varsigma", 0x3C2), L("tau", 0x3C4), L("upsilon", 0x3C5),
+  L("phi", 0x3D5), L("varphi", 0x3C6), L("chi", 0x3C7), L("psi", 0x3C8),
+  L("omega", 0x3C9), L("Gamma", 0x393), L("Delta", 0x394), L("Theta", 0x398),
+  L("Lambda", 0x39B), L("Xi", 0x39E), L("Pi", 0x3A0), L("Sigma", 0x3A3),
+  L("Upsilon", 0x3A5), L("Phi", 0x3A6), L("Psi", 0x3A8), L("Omega", 0x3A9),
+  L("varGamma", 0x393), L("varDelta", 0x394), L("varTheta", 0x398),
+  L("varLambda", 0x39B), L("varXi", 0x39E), L("varPi", 0x3A0),
+  L("varSigma", 0x3A3), L("varUpsilon", 0x3A5), L("varPhi", 0x3A6),
+  L("varPsi", 0x3A8), L("varOmega", 0x3A9),
+  L("ell", 'l'), L("imath", 'i'), L("jmath", 'j'), L("hbar", 'h'),
+  L("hslash", 'h'), L("Re", 'r'), L("Im", 'i'),
+#undef L
+#define N(n) {n, SYNC_MM_NAME, 0}
+  N("arccos"), N("arcsin"), N("arctan"), N("arg"), N("cos"), N("cosh"),
+  N("cot"), N("coth"), N("csc"), N("deg"), N("det"), N("dim"), N("exp"),
+  N("gcd"), N("hom"), N("inf"), N("ker"), N("lg"), N("lim"), N("liminf"),
+  N("limsup"), N("ln"), N("log"), N("max"), N("min"), N("Pr"), N("sec"),
+  N("sin"), N("sinh"), N("sup"), N("tan"), N("tanh"), N("injlim"),
+  N("projlim"), {"bmod", SYNC_MM_NAME, 1}, {"mod", SYNC_MM_NAME, 1},
+#undef N
+#define S(n, k) {n, SYNC_MM_##k, 0}
+  S("mathrm", STYLE), S("mathit", STYLE), S("mathbf", STYLE),
+  S("mathsf", STYLE), S("mathtt", STYLE), S("mathcal", STYLE),
+  S("mathbb", STYLE), S("mathfrak", STYLE), S("mathscr", STYLE),
+  S("mathnormal", STYLE), S("mathbfit", STYLE), S("boldsymbol", STYLE),
+  S("bm", STYLE), S("pmb", STYLE), S("mathop", STYLE), S("mathbin", STYLE),
+  S("mathrel", STYLE), S("mathord", STYLE), S("mathopen", STYLE),
+  S("mathclose", STYLE), S("mathpunct", STYLE), S("mathinner", STYLE),
+  S("operatorname", STYLE), S("hat", STYLE), S("widehat", STYLE),
+  S("tilde", STYLE), S("widetilde", STYLE), S("bar", STYLE),
+  S("overline", STYLE), S("underline", STYLE), S("vec", STYLE),
+  S("dot", STYLE), S("ddot", STYLE), S("dddot", STYLE), S("breve", STYLE),
+  S("check", STYLE), S("acute", STYLE), S("grave", STYLE),
+  S("mathring", STYLE), S("overbrace", STYLE), S("underbrace", STYLE),
+  S("overrightarrow", STYLE), S("overleftarrow", STYLE),
+  S("overleftrightarrow", STYLE), S("underrightarrow", STYLE),
+  S("underleftarrow", STYLE), S("boxed", STYLE), S("smash", STYLE),
+  S("cancel", STYLE), S("bcancel", STYLE), S("xcancel", STYLE),
+  S("ensuremath", STYLE), S("substack", STYLE), S("lefteqn", STYLE),
+  S("mathclap", STYLE), S("mathllap", STYLE), S("mathrlap", STYLE),
+  S("clap", STYLE), S("llap", STYLE), S("rlap", STYLE), S("pod", STYLE),
+  S("text", TEXT), S("textrm", TEXT), S("textit", TEXT), S("textbf", TEXT),
+  S("textsf", TEXT), S("texttt", TEXT), S("textup", TEXT), S("textsl", TEXT),
+  S("textsc", TEXT), S("textnormal", TEXT), S("textmd", TEXT),
+  S("mbox", TEXT), S("hbox", TEXT), S("emph", TEXT), S("fbox", TEXT),
+  S("intertext", TEXT), S("shortintertext", TEXT),
+  S("label", SKIP), S("phantom", SKIP), S("hphantom", SKIP),
+  S("vphantom", SKIP), S("hspace", SKIP), S("vspace", SKIP), S("color", SKIP),
+  S("tag", REFERENCE), S("eqref", REFERENCE), S("ref", REFERENCE),
+  S("autoref", REFERENCE), S("cref", REFERENCE), S("Cref", REFERENCE),
+  S("pageref", REFERENCE), S("cite", REFERENCE), S("citep", REFERENCE),
+  S("citet", REFERENCE),
+  S("kern", DIMEN), S("mkern", DIMEN), S("hskip", DIMEN), S("mskip", DIMEN),
+  S("frac", FRACTION), S("dfrac", FRACTION), S("tfrac", FRACTION),
+  S("cfrac", FRACTION), S("binom", FRACTION), S("dbinom", FRACTION),
+  S("tbinom", FRACTION), S("overset", FRACTION), S("stackrel", FRACTION),
+  S("underset", UNDERSET), S("textcolor", COLOR), S("sqrt", ROOT),
+  S("xrightarrow", ARROW), S("xleftarrow", ARROW), S("xRightarrow", ARROW),
+  S("xLeftarrow", ARROW), S("xleftrightarrow", ARROW),
+  S("xLeftrightarrow", ARROW), S("xmapsto", ARROW),
+  S("xhookrightarrow", ARROW), S("xhookleftarrow", ARROW),
+  S("begin", ENV), S("end", ENV), S("pmod", MOD),
+  S("displaystyle", IGNORE), S("textstyle", IGNORE),
+  S("scriptstyle", IGNORE), S("scriptscriptstyle", IGNORE),
+  S("left", IGNORE), S("right", IGNORE), S("middle", IGNORE),
+  S("big", IGNORE), S("Big", IGNORE), S("bigg", IGNORE), S("Bigg", IGNORE),
+  S("bigl", IGNORE), S("bigr", IGNORE), S("bigm", IGNORE),
+  S("Bigl", IGNORE), S("Bigr", IGNORE), S("Bigm", IGNORE),
+  S("biggl", IGNORE), S("biggr", IGNORE), S("biggm", IGNORE),
+  S("Biggl", IGNORE), S("Biggr", IGNORE), S("Biggm", IGNORE),
+  S("limits", IGNORE), S("nolimits", IGNORE), S("displaylimits", IGNORE),
+  S("nonumber", IGNORE), S("notag", IGNORE), S("mathstrut", IGNORE),
+  S("strut", IGNORE), S("allowbreak", IGNORE), S("nobreak", IGNORE),
+  S("relax", IGNORE), S("protect", IGNORE), S("displaybreak", IGNORE),
+  S("not", IGNORE), S("hline", IGNORE), S("hfill", IGNORE),
+  S("boldmath", IGNORE), S("unboldmath", IGNORE), S("rm", IGNORE),
+  S("bf", IGNORE), S("it", IGNORE), S("sf", IGNORE), S("tt", IGNORE),
+  S("cal", IGNORE),
+#undef S
+};
+
+// Symbols that are known not to typeset letters (other macros leave a gap).
+static const char *sync_math_symbols[] = {
+  "times", "cdot", "cdots", "ldots", "dots", "dotsc", "dotsb", "dotsm",
+  "vdots", "ddots", "in", "notin", "ni", "subset", "subseteq", "supset",
+  "supseteq", "cup", "cap", "bigcup", "bigcap", "sum", "prod", "coprod",
+  "int", "iint", "iiint", "oint", "infty", "partial", "nabla", "pm", "mp",
+  "leq", "le", "geq", "ge", "neq", "ne", "approx", "sim", "simeq", "cong",
+  "equiv", "propto", "to", "gets", "rightarrow", "leftarrow", "Rightarrow",
+  "Leftarrow", "leftrightarrow", "Leftrightarrow", "longrightarrow",
+  "longleftarrow", "Longrightarrow", "Longleftarrow", "mapsto", "longmapsto",
+  "implies", "impliedby", "iff", "uparrow", "downarrow", "Uparrow",
+  "Downarrow", "forall", "exists", "nexists", "neg", "lnot", "land", "lor",
+  "wedge", "vee", "bigwedge", "bigvee", "oplus", "otimes", "odot", "ominus",
+  "bigoplus", "bigotimes", "bigodot", "circ", "bullet", "star", "ast",
+  "dagger", "ddagger", "langle", "rangle", "lfloor", "rfloor", "lceil",
+  "rceil", "lvert", "rvert", "lVert", "rVert", "vert", "Vert", "mid", "nmid",
+  "parallel", "perp", "emptyset", "varnothing", "setminus", "backslash",
+  "prime", "quad", "qquad", "colon", "top", "bot", "angle", "triangle",
+  "square", "ll", "gg", "prec", "succ", "preceq", "succeq", "lesssim",
+  "gtrsim", "hookrightarrow", "hookleftarrow", "div", "diamond", "cdotp",
+  "ldotp", "triangleq", "coloneqq", "eqqcolon", "coloneq", "doteq",
+  "models", "vdash", "dashv", "sqcup", "sqcap", "uplus", "amalg", "lhd",
+  "rhd", "aleph", "surd", "lbrace", "rbrace", "lbrack", "rbrack", "over",
+  "choose", "atop", "cr", "enspace", "thinspace", "medspace", "thickspace",
+  "negthinspace", "negmedspace", "negthickspace", "leqslant", "geqslant",
+  "subsetneq", "supsetneq", "rightleftharpoons", "rightharpoonup",
+  "leftharpoonup", "circledast", "sphericalangle", "measuredangle",
+  "checkmark", "dag", "ddag", "lozenge", "blacksquare", "Box", "Diamond",
+  "flat", "sharp", "natural", "clubsuit", "heartsuit", "diamondsuit",
+  "spadesuit", "wp", "mho", "complement", "therefore", "because",
+  "leadsto", "nearrow", "searrow", "swarrow", "nwarrow", "updownarrow",
+  "oslash", "bigtriangleup", "bigtriangledown", "wr", "asymp", "bowtie",
+  "smile", "frown", "vartriangle", "trianglelefteq", "trianglerighteq",
+};
+
+static int sync_math_macro_kind(const char *name, int *value)
+{
+  *value = 0;
+  for (size_t i = 0; i < sizeof(sync_math_macros) / sizeof(sync_math_macros[0]); i++)
+    if (strcmp(sync_math_macros[i].name, name) == 0)
+    {
+      *value = sync_math_macros[i].value;
+      return sync_math_macros[i].kind;
+    }
+  for (size_t i = 0; i < sizeof(sync_math_symbols) / sizeof(sync_math_symbols[0]); i++)
+    if (strcmp(sync_math_symbols[i], name) == 0)
+      return SYNC_MM_SYMBOL;
+  return SYNC_MM_UNKNOWN;
+}
+
+// Operators whose scripts are limits in display style: a superscript is
+// above them, and typeset first.
+static bool sync_math_has_limits(const char *name, bool display)
+{
+  static const char *names[] = {
+    "lim", "liminf", "limsup", "max", "min", "sup", "inf", "det", "Pr", "gcd",
+    "injlim", "projlim", NULL
+  };
+  if (strcmp(name, "overbrace") == 0 || strcmp(name, "underbrace") == 0)
+    return true;
+  for (const char **p = names; display && *p; p++)
+    if (strcmp(name, *p) == 0)
+      return true;
+  return false;
+}
+
+static void sync_math_list(struct sync_math *m, const struct sync_tok *s, int n);
+
+// Text in math, as in \text{...}: spaces split words, $...$ is math.
+static void sync_math_text(struct sync_math *m, const struct sync_tok *s, int n)
+{
+  sync_math_split(m);
+  for (int i = 0; i < n;)
+  {
+    int c = s[i].c;
+    if (c == '$')
+    {
+      int e = i + 1;
+      while (e < n && s[e].c != '$')
+        e += s[e].c == '\\' ? 2 : 1;
+      if (e > n)
+        e = n;
+      bool display = m->display;
+      m->display = false;
+      sync_math_list(m, s + i + 1, e - i - 1);
+      m->display = display;
+      sync_math_split(m);
+      i = e + 1;
+      continue;
+    }
+    if (c == '\\')
+    {
+      char name[32];
+      int j = sync_tok_name(s, n, i, name, sizeof(name));
+      int value, kind = sync_math_macro_kind(name, &value);
+      if (j < n && sync_is_letter(s[i + 1].c))
+      {
+        // The text of font macros is read on (their argument is a group).
+        if (kind == SYNC_MM_SKIP || kind == SYNC_MM_REFERENCE)
+        {
+          int a, b;
+          j = sync_tok_arg(s, n, j, &a, &b);
+        }
+        if (kind == SYNC_MM_REFERENCE || (kind != SYNC_MM_TEXT &&
+                                          kind != SYNC_MM_IGNORE &&
+                                          kind != SYNC_MM_SKIP))
+        {
+          sync_math_split(m);
+          sync_gap_merge(m->gap, SYNC_MATH_GAP);
+        }
+        j = sync_tok_spaces(s, n, j);
+      }
+      else if (!name[0] || !strchr("\"'`^~=.", name[0]))
+        // Control symbols other than accents (na\"ive) split words
+        sync_math_split(m);
+      i = j;
+      continue;
+    }
+    if (c == '~')
+      sync_math_split(m);
+    else if (c != '{' && c != '}')
+      sync_math_emit(m, c, s[i].col, s[i].end);
+    i++;
+  }
+  sync_math_split(m);
+}
+
+// The atom at s[i]: a character, a group or a control sequence with its
+// arguments. Returns the index after it, and when `process`, appends its
+// characters. *name is the name of a control word, else empty.
+static int sync_math_atom(struct sync_math *m, const struct sync_tok *s, int n,
+                          int i, bool process, char *name)
+{
+  name[0] = 0;
+  int c = s[i].c;
+  if (c == '{')
+  {
+    int e = sync_tok_group_end(s, n, i, '{', '}');
+    if (process)
+      sync_math_list(m, s + i + 1, e - i - 1);
+    return e < n ? e + 1 : n;
+  }
+  if (c != '\\')
+  {
+    if (process)
+    {
+      if (c == '&' || c == '~')
+        sync_math_split(m);
+      else if (c != '}' && c != '$' && c != '#')
+        sync_math_emit(m, c, s[i].col, s[i].end);
+    }
+    return i + 1;
+  }
+
+  int j = sync_tok_name(s, n, i, name, 32);
+  if (j == i + 1)
+    return j;
+  if (!sync_is_letter(s[i + 1].c))
+  {
+    // Control symbols: spaces and symbols. After \\, the number of the row
+    // can come.
+    bool row = name[0] == '\\';
+    name[0] = 0;
+    if (process)
+    {
+      sync_math_split(m);
+      if (row)
+        sync_gap_merge(m->gap, SYNC_MATH_GAP);
+    }
+    if (row)
+    {
+      int a, b;
+      if (j < n && s[j].c == '*')
+        j++;
+      j = sync_tok_optional(s, n, j, &a, &b);
+    }
+    return j;
+  }
+
+  int a, b, a2, b2, oa, ob;
+  const struct sync_macro *d = sync_macros_find(m->t->macros, name);
+  if (d)
+  {
+    // Only its extent: sync_math_list expands it.
+    if (d->def)
+      j = sync_tok_optional(s, n, j, &oa, &ob);
+    for (int k = d->def ? 1 : 0; k < d->nargs; k++)
+      j = sync_tok_arg(s, n, j, &a, &b);
+    if (process)
+    {
+      sync_math_split(m);
+      sync_gap_merge(m->gap, SYNC_MATH_GAP | TXP_TEXT_GAP_ANYWHERE);
+    }
+    return j;
+  }
+
+  int value, kind = sync_math_macro_kind(name, &value);
+  int col = s[i].col, end = s[j - 1].end;
+  switch (kind)
+  {
+    case SYNC_MM_UNKNOWN:
+      if (process)
+      {
+        sync_math_split(m);
+        sync_gap_merge(m->gap, SYNC_MATH_GAP | TXP_TEXT_GAP_ANYWHERE);
+      }
+      return j;
+    case SYNC_MM_SYMBOL:
+      if (process)
+        sync_math_split(m);
+      return j;
+    case SYNC_MM_IGNORE:
+      return j;
+    case SYNC_MM_LETTER:
+      if (process)
+        sync_math_emit(m, value, col, end);
+      return j;
+    case SYNC_MM_NAME:
+      if (process)
+      {
+        sync_math_split(m);
+        for (const char *p = value ? "mod" : name; *p; p++)
+          sync_math_emit(m, *p, col, end);
+        sync_math_split(m);
+      }
+      return j;
+    case SYNC_MM_DIMEN:
+    {
+      // \mkern-9mu, \hskip 2pt
+      j = sync_tok_spaces(s, n, j);
+      int k = j;
+      while (k < n && (s[k].c == '-' || s[k].c == '+' || s[k].c == '.' ||
+                       (s[k].c >= '0' && s[k].c <= '9')))
+        k++;
+      if (k > j && k + 1 < n && sync_is_letter(s[k].c) &&
+          sync_is_letter(s[k + 1].c))
+        k += 2;
+      if (process)
+        sync_math_split(m);
+      return k;
+    }
+    case SYNC_MM_ENV:
+    {
+      // Inner environments: \begin{cases}, \begin{array}{cc}, \begin{aligned}[t]
+      char env[32] = "";
+      j = sync_tok_arg(s, n, j, &a, &b);
+      for (int k = a; k < b && k - a < 31; k++)
+        env[k - a] = s[k].c, env[k - a + 1] = 0;
+      if (strcmp(name, "begin") == 0)
+      {
+        j = sync_tok_optional(s, n, j, &oa, &ob);
+        if (strncmp(env, "array", 5) == 0 || strncmp(env, "subarray", 8) == 0 ||
+            strncmp(env, "alignedat", 9) == 0 || strncmp(env, "tabular", 7) == 0)
+          j = sync_tok_arg(s, n, j, &a, &b);
+      }
+      if (process)
+        sync_math_split(m);
+      return j;
+    }
+    case SYNC_MM_ROOT:
+    case SYNC_MM_ARROW:
+      j = sync_tok_optional(s, n, j, &oa, &ob);
+      j = sync_tok_arg(s, n, j, &a, &b);
+      if (process)
+      {
+        // The index of a root comes first, what is below an arrow last.
+        if (kind == SYNC_MM_ROOT && oa >= 0)
+          sync_math_list(m, s + oa, ob - oa);
+        sync_math_list(m, s + a, b - a);
+        if (kind == SYNC_MM_ARROW && oa >= 0)
+          sync_math_list(m, s + oa, ob - oa);
+      }
+      return j;
+  }
+
+  // Macros with arguments, after a star and optional arguments
+  if (j < n && s[j].c == '*')
+    j++;
+  while ((j = sync_tok_optional(s, n, j, &oa, &ob)), oa >= 0)
+    ;
+  j = sync_tok_arg(s, n, j, &a, &b);
+  a2 = b2 = 0;
+  if (kind == SYNC_MM_FRACTION || kind == SYNC_MM_UNDERSET || kind == SYNC_MM_COLOR)
+    j = sync_tok_arg(s, n, j, &a2, &b2);
+  if (!process)
+    return j;
+  switch (kind)
+  {
+    case SYNC_MM_STYLE:
+      sync_math_list(m, s + a, b - a);
+      break;
+    case SYNC_MM_TEXT:
+      sync_math_text(m, s + a, b - a);
+      break;
+    case SYNC_MM_REFERENCE:
+      sync_math_split(m);
+      sync_gap_merge(m->gap, SYNC_MATH_GAP | TXP_TEXT_GAP_ANYWHERE);
+      break;
+    case SYNC_MM_FRACTION:
+      sync_math_list(m, s + a, b - a);
+      sync_math_list(m, s + a2, b2 - a2);
+      break;
+    case SYNC_MM_UNDERSET:
+      sync_math_list(m, s + a2, b2 - a2);
+      sync_math_list(m, s + a, b - a);
+      break;
+    case SYNC_MM_COLOR:
+      sync_math_list(m, s + a2, b2 - a2);
+      break;
+    case SYNC_MM_MOD:
+      sync_math_split(m);
+      for (const char *p = "mod"; *p; p++)
+        sync_math_emit(m, *p, col, end);
+      sync_math_split(m);
+      sync_math_list(m, s + a, b - a);
+      break;
+  }
+  return j;
+}
+
+// Append the characters of the math s[0...n): atoms with their scripts.
+static void sync_math_list(struct sync_math *m, const struct sync_tok *s, int n)
+{
+  struct sync_tok *own = NULL;
+  int i = 0;
+  while (i < n)
+  {
+    i = sync_tok_spaces(s, n, i);
+    if (i >= n)
+      break;
+    char name[32];
+
+    // A macro of the document: read on in its text, in place of the use.
+    if (s[i].c == '\\' && i + 1 < n && sync_is_letter(s[i + 1].c))
+    {
+      int j = sync_tok_name(s, n, i, name, sizeof(name));
+      const struct sync_macro *d = sync_macros_find(m->t->macros, name);
+      int len;
+      struct sync_tok *e = d && m->expansions < SYNC_MAX_EXPANSIONS
+                               ? sync_expand(d, s, n, i, j, &len) : NULL;
+      if (e)
+      {
+        m->expansions++;
+        free(own);
+        own = e;
+        s = e;
+        n = len;
+        i = 0;
+        continue;
+      }
+    }
+
+    // The nucleus (none in {}^{14}C or at the start of a script)
+    int start = i, nucleus = i, nucleus_end = i;
+    name[0] = 0;
+    if (s[i].c != '^' && s[i].c != '_')
+      nucleus_end = i = sync_math_atom(m, s, n, i, false, name);
+    bool limits = name[0] && sync_math_has_limits(name, m->display);
+
+    // Its scripts
+    int sup = -1, sup_end = 0, sub = -1, sub_end = 0;
+    bool prime = false;
+    for (;;)
+    {
+      int j = sync_tok_spaces(s, n, i);
+      if (j >= n)
+        break;
+      if (s[j].c == '\'')
+      {
+        prime = true;
+        i = j + 1;
+        continue;
+      }
+      if (s[j].c == '^' || s[j].c == '_')
+      {
+        char script[32];
+        int a = sync_tok_spaces(s, n, j + 1);
+        int b = a < n ? sync_math_atom(m, s, n, a, false, script) : n;
+        if (s[j].c == '^')
+          sup = a, sup_end = b;
+        else
+          sub = a, sub_end = b;
+        i = b;
+        continue;
+      }
+      if (s[j].c == '\\')
+      {
+        char word[32];
+        int k = sync_tok_name(s, n, j, word, sizeof(word));
+        if (strcmp(word, "limits") == 0 || strcmp(word, "nolimits") == 0 ||
+            strcmp(word, "displaylimits") == 0)
+        {
+          if (word[0] == 'l')
+            limits = true;
+          else if (word[0] == 'n')
+            limits = false;
+          i = k;
+          continue;
+        }
+      }
+      break;
+    }
+
+    if (limits && sup >= 0)
+      sync_math_list(m, s + sup, sup_end - sup);
+    if (nucleus_end > nucleus)
+      sync_math_atom(m, s, nucleus_end, nucleus, true, name);
+    if (prime)
+      sync_math_split(m);
+    if (!limits && sup >= 0)
+      sync_math_list(m, s + sup, sup_end - sup);
+    if (sub >= 0)
+      sync_math_list(m, s + sub, sub_end - sub);
+    if (i == start)
+      i++;
+  }
+  free(own);
+}
+
+static bool sync_is_math_env(const char *env)
+{
+  static const char *names[] = {
+    "equation", "equation*", "align", "align*", "gather", "gather*",
+    "multline", "multline*", "flalign", "flalign*", "alignat", "alignat*",
+    "eqnarray", "eqnarray*", "displaymath", "math", "dmath", "dmath*", NULL
+  };
+  for (const char **p = names; *p; p++)
+    if (strcmp(*p, env) == 0)
+      return true;
+  return false;
+}
+
+// Where the math of t->math closes in line[i...]: the index of its closing
+// delimiter, with the index after it in *after, else where the line ends
+// (at a comment) with *after = -1.
+static int sync_math_close(const int *line, int n, int i,
+                           const struct sync_text *t, int *after)
+{
+  int depth = 0;
+  *after = -1;
+  for (; i < n; i++)
+  {
+    int c = line[i];
+    if (c == '%')
+      return i;
+    if (c == '{')
+      depth++;
+    else if (c == '}')
+      depth = depth > 0 ? depth - 1 : 0;
+    else if (c == '$' && depth == 0 && t->math == SYNC_MATH_DOLLAR)
+    {
+      *after = i + 1;
+      return i;
+    }
+    else if (c == '$' && t->math == SYNC_MATH_DOLLARS && i + 1 < n &&
+             line[i + 1] == '$')
+    {
+      *after = i + 2;
+      return i;
+    }
+    else if (c == '\\' && i + 1 < n)
+    {
+      int d = line[i + 1];
+      if ((d == ')' && t->math == SYNC_MATH_PAREN) ||
+          (d == ']' && t->math == SYNC_MATH_BRACKET))
+      {
+        *after = i + 2;
+        return i;
+      }
+      if (t->math == SYNC_MATH_ENV && sync_looking_at(line, n, i, "\\end{"))
+      {
+        char env[32];
+        sync_environment(line, n, i + 4, env, sizeof(env));
+        if (strcmp(env, t->math_env) == 0)
+        {
+          *after = i + 6 + strlen(env);
+          return i;
+        }
+      }
+      i++;
+    }
+  }
+  return n;
+}
+
+// The math of line[i...] (t->math is open): its characters are appended to
+// t up to where it closes. Returns the index after it, or where the line
+// ends.
+static int sync_math_line(const int *line, int n, int i, struct sync_text *t,
+                          bool *in_word, int *gap)
+{
+  static struct sync_tok toks[SYNC_TEXT_MAX];
+  int after, end = sync_math_close(line, n, i, t, &after);
+  int len = 0;
+  for (int j = i; j < end; j++)
+    toks[len++] = (struct sync_tok){line[j], j, j + 1};
+  struct sync_math m = {
+    .t = t, .in_word = in_word, .gap = gap,
+    .display = t->math != SYNC_MATH_DOLLAR && t->math != SYNC_MATH_PAREN,
+  };
+  sync_math_list(&m, toks, len);
+  if (after < 0)
+    return end;
+  *in_word = false;
+  if (t->math == SYNC_MATH_ENV)
+    // The number of the equation
+    sync_gap_merge(gap, SYNC_MATH_GAP);
+  t->math = SYNC_MATH_NONE;
+  return after;
+}
+
+/* The macros of the document */
+
+// The code points of a file without its comments, line breaks as spaces.
+// The caller frees the array.
+static int *sync_decode_file(fz_buffer *data, int *len)
+{
+  const char *p = (const char *)data->data, *end = p + data->len;
+  int *out = malloc((data->len + 1) * sizeof(int)), n = 0;
+  if (!out)
+    return NULL;
+  while (p < end)
+  {
+    int c;
+    p += fz_chartorune(&c, p);
+    if (c == '%' && !(n > 0 && out[n - 1] == '\\'))
+    {
+      while (p < end && *p != '\n')
+        p++;
+      for (p++; p < end && (*p == ' ' || *p == '\t'); p++)
+        ;
+      continue;
+    }
+    out[n++] = c == '\n' || c == '\r' || c == '\t' ? ' ' : c;
+  }
+  *len = n;
+  return out;
+}
+
+static int sync_skip_blank(const int *s, int n, int i)
+{
+  while (i < n && s[i] == ' ')
+    i++;
+  return i;
+}
+
+// The name of the control word at s[i] ("\name" or "{\name}"), returning the
+// index after it (i if there is none).
+static int sync_def_name(const int *s, int n, int i, char *name)
+{
+  int j = sync_skip_blank(s, n, i), k = 0;
+  bool braced = j < n && s[j] == '{';
+  if (braced)
+    j = sync_skip_blank(s, n, j + 1);
+  if (j >= n || s[j] != '\\')
+    return i;
+  for (j++; j < n && sync_is_letter(s[j]); j++)
+    if (k < 31)
+      name[k++] = s[j];
+  name[k] = 0;
+  if (braced)
+  {
+    j = sync_skip_blank(s, n, j);
+    if (j >= n || s[j] != '}')
+      return i;
+    j++;
+  }
+  return k ? j : i;
+}
+
+// The group at s[i] (after spaces): its contents [*a, *b), and the index
+// after it (i if there is none).
+static int sync_def_group(const int *s, int n, int i, int open, int close,
+                          int *a, int *b)
+{
+  int j = sync_skip_blank(s, n, i), depth = 0;
+  if (j >= n || s[j] != open)
+    return i;
+  for (int k = j; k < n; k++)
+  {
+    if (s[k] == '\\')
+      k++;
+    else if (s[k] == open)
+      depth++;
+    else if (s[k] == close && --depth == 0)
+    {
+      *a = j + 1;
+      *b = k;
+      return k + 1;
+    }
+  }
+  return i;
+}
+
+static int *sync_copy_ints(const int *s, int n)
+{
+  int *out = malloc((n > 0 ? n : 1) * sizeof(int));
+  if (out && n > 0)
+    memcpy(out, s, n * sizeof(int));
+  return out;
+}
+
+static void sync_macros_add(struct sync_macros *ms, const char *name,
+                            int nargs, const int *def, int ndef,
+                            const int *body, int len)
+{
+  if (ms->count == ms->cap)
+  {
+    int cap = ms->cap ? ms->cap * 2 : 64;
+    struct sync_macro *items = realloc(ms->items, cap * sizeof(*items));
+    if (!items)
+      return;
+    ms->items = items;
+    ms->cap = cap;
+  }
+  struct sync_macro *d = &ms->items[ms->count++];
+  snprintf(d->name, sizeof(d->name), "%s", name);
+  d->nargs = nargs;
+  d->def = def ? sync_copy_ints(def, ndef) : NULL;
+  d->ndef = ndef;
+  d->body = sync_copy_ints(body, len);
+  d->len = len;
+}
+
+// Read the definitions of a file, and of the files it inputs.
+static void sync_macros_read(struct persistent_state *ps, ui_state *ui,
+                             struct sync_macros *ms, const char *path,
+                             int depth)
+{
+  fz_buffer *data = sync_file_data(ps, ui, path);
+  int n;
+  int *s = data ? sync_decode_file(data, &n) : NULL;
+  if (!s)
+    return;
+  for (int i = 0; i < n; i++)
+  {
+    if (s[i] != '\\')
+      continue;
+    char cmd[32], name[32];
+    int j = i + 1, k = 0;
+    for (; j < n && sync_is_letter(s[j]); j++)
+      if (k < 31)
+        cmd[k++] = s[j];
+    cmd[k] = 0;
+    if (k == 0)
+    {
+      // A control symbol: \\, \%
+      i = j;
+      continue;
+    }
+    int a, b, da = -1, db = -1, nargs = 0;
+    if (strcmp(cmd, "newcommand") == 0 || strcmp(cmd, "renewcommand") == 0 ||
+        strcmp(cmd, "providecommand") == 0 ||
+        strcmp(cmd, "DeclareRobustCommand") == 0)
+    {
+      // \newcommand*{\name}[nargs][default]{body}
+      if (j < n && s[j] == '*')
+        j++;
+      int e = sync_def_name(s, n, j, name);
+      if (e == j)
+        continue;
+      j = e;
+      e = sync_def_group(s, n, j, '[', ']', &a, &b);
+      if (e != j)
+      {
+        for (int q = a; q < b; q++)
+          if (s[q] >= '0' && s[q] <= '9')
+            nargs = nargs * 10 + s[q] - '0';
+        j = sync_def_group(s, n, e, '[', ']', &da, &db);
+      }
+      e = sync_def_group(s, n, j, '{', '}', &a, &b);
+      if (e == j)
+        continue;
+      sync_macros_add(ms, name, nargs, da >= 0 ? s + da : NULL,
+                      da >= 0 ? db - da : 0, s + a, b - a);
+      i = e - 1;
+    }
+    else if (strcmp(cmd, "def") == 0 || strcmp(cmd, "gdef") == 0)
+    {
+      // \def\name#1#2{body}; not with delimited parameters
+      int e = sync_def_name(s, n, j, name);
+      if (e == j)
+        continue;
+      j = e;
+      bool plain = true;
+      while (j < n && s[j] != '{')
+      {
+        if (s[j] == '#' && j + 1 < n && s[j + 1] >= '1' && s[j + 1] <= '9')
+          nargs++, j += 2;
+        else
+          plain = false, j++;
+      }
+      e = sync_def_group(s, n, j, '{', '}', &a, &b);
+      if (e == j)
+        continue;
+      if (plain)
+        sync_macros_add(ms, name, nargs, NULL, 0, s + a, b - a);
+      i = e - 1;
+    }
+    else if (strcmp(cmd, "DeclareMathOperator") == 0)
+    {
+      // \DeclareMathOperator*{\name}{text}: \operatorname{text}
+      if (j < n && s[j] == '*')
+        j++;
+      int e = sync_def_name(s, n, j, name);
+      if (e == j)
+        continue;
+      j = e;
+      e = sync_def_group(s, n, j, '{', '}', &a, &b);
+      if (e == j)
+        continue;
+      static const char op[] = "\\operatorname{";
+      int len = (int)strlen(op), *body = malloc((len + b - a + 1) * sizeof(int));
+      if (body)
+      {
+        for (int q = 0; q < len; q++)
+          body[q] = op[q];
+        memcpy(body + len, s + a, (b - a) * sizeof(int));
+        body[len + b - a] = '}';
+        sync_macros_add(ms, name, 0, NULL, 0, body, len + b - a + 1);
+        free(body);
+      }
+      i = e - 1;
+    }
+    else if ((strcmp(cmd, "input") == 0 || strcmp(cmd, "include") == 0) &&
+             depth < 2)
+    {
+      int e = sync_def_group(s, n, j, '{', '}', &a, &b);
+      if (e == j || b - a >= 250)
+        continue;
+      char file[256 + 4];
+      int len = 0;
+      for (int q = a; q < b; q++)
+        file[len++] = s[q] < 128 ? s[q] : '_';
+      file[len] = 0;
+      if (!strchr(file, '.'))
+        strcat(file, ".tex");
+      sync_macros_read(ps, ui, ms, file, depth + 1);
+      i = e - 1;
+    }
+  }
+  free(s);
+}
+
+static void sync_macros_free(struct sync_macros *ms)
+{
+  for (int i = 0; i < ms->count; i++)
+  {
+    free(ms->items[i].def);
+    free(ms->items[i].body);
+  }
+  free(ms->items);
+  ms->items = NULL;
+  ms->count = ms->cap = 0;
+}
+
+// The macros of the document, read from its main file (with the files it
+// inputs) as the editor last sent them.
+static void sync_macros_load(struct persistent_state *ps, ui_state *ui,
+                             struct sync_macros *ms)
+{
+  sync_macros_free(ms);
+  sync_macros_read(ps, ui, ms, ps->doc_name, 0);
+}
+
 // Split a source line into the words likely to be typeset as text: macro
-// names, math, optional arguments, and the arguments of macros that do not
-// typeset text are left out. The words are appended to t, which also keeps
-// track of the segments (see sync_word) from line to line.
+// names, optional arguments, and the arguments of macros that do not
+// typeset text are left out, math is read as it is typeset (sync_math_line).
+// The words are appended to t, which also keeps track of the segments (see
+// sync_word) and of math from line to line.
 static void sync_source_words(const int *line, int n, struct sync_text *t)
 {
-  bool math = false, in_word = false;
-  int gap = 0;
+  bool in_word = false;
+  int gap = t->pending_gap;
+  // The characters and the gap after the last math of the line whose gap
+  // carries over to the next line
+  int math_nchars = -1, math_gap = 0;
   // Brackets right after a macro hold an optional argument (\item[...],
   // \\[2pt]); elsewhere they are text.
   bool after_macro = false;
@@ -496,6 +1633,23 @@ static void sync_source_words(const int *line, int n, struct sync_text *t)
     int c = line[i];
     if (c == '%')
       break;
+    if (t->math && t->tikz && !sync_in_node(t))
+    {
+      // Coordinates of a drawing: ($(a)!0.5!(b)$)
+      int after, end = sync_math_close(line, n, i, t, &after);
+      if (after >= 0)
+        t->math = SYNC_MATH_NONE;
+      i = after >= 0 ? after : end;
+      continue;
+    }
+    if (t->math)
+    {
+      bool env = t->math == SYNC_MATH_ENV;
+      i = sync_math_line(line, n, i, t, &in_word, &gap);
+      if (env || t->math)
+        math_nchars = t->nchars, math_gap = gap;
+      continue;
+    }
     if (c == '\\' && i + 1 < n)
     {
       int d = line[i + 1];
@@ -517,7 +1671,7 @@ static void sync_source_words(const int *line, int n, struct sync_text *t)
         if (t->tikz && !sync_in_node(t) && strcmp(name, "node") == 0)
           t->node = true;
         bool mint = strcmp(name, "mintinline") == 0;
-        if (!math && (mint || strcmp(name, "verb") == 0 ||
+        if ((mint || strcmp(name, "verb") == 0 ||
                       strcmp(name, "lstinline") == 0))
         {
           // \verb|code|, \mintinline{lang}{code}, \lstinline[opts]|code|
@@ -535,7 +1689,7 @@ static void sync_source_words(const int *line, int n, struct sync_text *t)
           }
           continue;
         }
-        if (!math && sync_macro_moves_argument(name))
+        if (sync_macro_moves_argument(name))
         {
           while (i < n && line[i] == ' ')
             i++;
@@ -544,7 +1698,7 @@ static void sync_source_words(const int *line, int n, struct sync_text *t)
           if (i < n && line[i] == '{')
             sync_segment_open(t, SYNC_SEGMENT_ARGUMENT);
         }
-        else if (!math && sync_macro_skips_argument(name))
+        else if (sync_macro_skips_argument(name))
         {
           if (strcmp(name, "def") == 0)
             // \def\name{...}
@@ -583,6 +1737,13 @@ static void sync_source_words(const int *line, int n, struct sync_text *t)
               t->hidden = strcmp(env, "comment") == 0;
               i = sync_verbatim_environment(line, n, i, t);
             }
+            else if (begin && sync_is_math_env(env))
+            {
+              t->math = SYNC_MATH_ENV;
+              strcpy(t->math_env, env);
+              in_word = false;
+              gap = 0;
+            }
             continue;
           }
           if (i < n && line[i] == '{')
@@ -595,9 +1756,9 @@ static void sync_source_words(const int *line, int n, struct sync_text *t)
         continue;
       }
       if (d == '(' || d == '[')
-        math = true, in_word = false, gap = TXP_TEXT_MAX_GAP;
-      else if (d == ')' || d == ']')
-        math = false, in_word = false;
+        t->math = d == '(' ? SYNC_MATH_PAREN : SYNC_MATH_BRACKET, gap = 0;
+      if (d == '(' || d == '[' || d == ')' || d == ']')
+        in_word = false;
       // Other control symbols (accents, \_, \&, ...) do not split words.
       after_macro = d == '\\';
       i += 2;
@@ -605,15 +1766,11 @@ static void sync_source_words(const int *line, int n, struct sync_text *t)
     }
     if (c == '$')
     {
-      math = !math;
-      in_word = false;
-      gap = TXP_TEXT_MAX_GAP;
-      i++;
-      continue;
-    }
-    if (math)
-    {
-      i++;
+      bool dollars = i + 1 < n && line[i + 1] == '$';
+      t->math = dollars ? SYNC_MATH_DOLLARS : SYNC_MATH_DOLLAR;
+      in_word = after_macro = false;
+      gap = 0;
+      i += dollars ? 2 : 1;
       continue;
     }
     if (c == '[' && after_macro)
@@ -667,21 +1824,15 @@ static void sync_source_words(const int *line, int n, struct sync_text *t)
     int f = txp_fold_char(c);
     if (f)
     {
-      sync_add_char(t, &in_word, i, f, gap);
+      sync_add_char(t, &in_word, i, i + 1, f, gap);
       gap = 0;
     }
     else if (c != '{' && c != '}')
       in_word = false;
     i++;
   }
-}
-
-// The contents of a file of the document, as the editor last sent it.
-static fz_buffer *sync_file_data(struct persistent_state *ps, ui_state *ui,
-                                 const char *path)
-{
-  fileentry_t *e = send(find_file, ui->eng, ps->ctx, path);
-  return e ? (e->edit_data ? e->edit_data : e->fs_data) : NULL;
+  // Other gaps at the end of a line stand for markup (\label, \hline).
+  t->pending_gap = t->nchars == math_nchars ? math_gap : 0;
 }
 
 // The start of a line (1-based) of a file, NULL past its end.
@@ -735,6 +1886,27 @@ static const char *sync_text_begin(fz_buffer *data, int first,
   return p;
 }
 
+// A cursor inside the name of a macro that typeset characters of words
+// [w, t->nwords) (\al|pha, \D|in) stands before the macro.
+static int sync_macro_column(const int *line, int n, int column,
+                             const struct sync_text *t, int w)
+{
+  if (column <= 0 || column >= n || !sync_is_letter(line[column]))
+    return column;
+  int i = column;
+  while (i > 0 && sync_is_letter(line[i - 1]))
+    i--;
+  int slashes = 0;
+  for (int j = i - 1; j >= 0 && line[j] == '\\'; j--)
+    slashes++;
+  if (slashes % 2 == 0)
+    return column;
+  for (int k = w < t->nwords ? t->words[w].first : t->nchars; k < t->nchars; k++)
+    if (t->source[k] == i - 1)
+      return i - 1;
+  return column;
+}
+
 // Forward: the position of the editor cursor (ui->sync_target) in the text
 // of the displayed page, with the length of the matched text (0 if not
 // found; only text of at least min_len characters is looked for, *max_len is
@@ -757,6 +1929,9 @@ static int sync_refine_by_text(struct persistent_state *ps, ui_state *ui,
   int target = ui->sync_target.line;
   fz_buffer *data = sync_file_data(ps, ui, ui->sync_target.path);
   static struct sync_text t;
+  static struct sync_macros macros;
+  sync_macros_load(ps, ui, &macros);
+  t.macros = &macros;
   int first = target > 2 ? target - 2 : 1;
   const char *p = data ? sync_text_begin(data, first, &t) : NULL;
   if (!p)
@@ -776,8 +1951,14 @@ static int sync_refine_by_text(struct persistent_state *ps, ui_state *ui,
       w0 = t.nwords;
     sync_source_words(line, n, &t);
     if (l == target)
+    {
       w1 = t.nwords;
+      column = sync_macro_column(line, n, column, &t, w0);
+    }
   }
+  if (getenv("TXP_SYNC_DEBUG"))
+    fprintf(stderr, "[synctex forward] words %d-%d of %d, math %d, tikz %d\n",
+            w0, w1, t.nwords, t.math, t.tikz);
   if (w0 == w1)
     return 0;
 
@@ -797,17 +1978,32 @@ static int sync_refine_by_text(struct persistent_state *ps, ui_state *ui,
   if (k == -1)
     k = w1 - 1;
 
-  // Number of folded characters of word k before the cursor. The cursor is
-  // at the left edge of the next one, or at the right edge of the previous
-  // one when it follows it directly (at the end of the word, or before
-  // markup inside it, as in d|\_in).
-  int in_word = 0;
+  // The character of word k at the cursor: the cursor is at its left edge
+  // when it stands right before it, else at the right edge of the one it
+  // follows directly (at the end of the word, or before markup inside it,
+  // as in d|\_in), else at the left edge of the next one. The characters of
+  // math are not in the order of the source.
   const int *src = t.source + t.words[k].first;
-  while (in_word < t.words[k].count && src[in_word] < column)
-    in_word++;
-  bool after = in_word == t.words[k].count ||
-               (in_word > 0 && src[in_word - 1] == column - 1 &&
-                src[in_word] > column);
+  const int *src_end = t.source_end + t.words[k].first;
+  int count = t.words[k].count, in_word = -1;
+  bool after = false;
+  for (int i = 0; i < count && in_word < 0; i++)
+    if (src[i] == column)
+      in_word = i;
+  for (int i = count - 1; i >= 0 && in_word < 0; i--)
+    if (src_end[i] == column)
+      in_word = i, after = true;
+  for (int i = 0; i < count; i++)
+    if (src[i] > column && (in_word < 0 || (!after && src[i] < src[in_word])))
+      in_word = i;
+  if (in_word < 0)
+  {
+    in_word = 0;
+    for (int i = 1; i < count; i++)
+      if (src_end[i] > src_end[in_word])
+        in_word = i;
+    after = true;
+  }
 
   // The words typeset with word k: those of its segment.
   static int seq[SYNC_TEXT_MAX];
@@ -821,20 +2017,45 @@ static int sync_refine_by_text(struct persistent_state *ps, ui_state *ui,
     }
 
   // Try the longest needles first: a single short word matches anywhere.
+  // Spans are in words, grown to SYNC_NEEDLE_MIN characters.
   static const int spans[][2] = {{0, 2}, {-1, 1}, {0, 1}, {-1, 0}, {-2, 0}, {0, 0}};
   static int needle[SYNC_TEXT_MAX];
   static unsigned char gap[SYNC_TEXT_MAX];
+  int tried[sizeof(spans) / sizeof(spans[0])][2];
   for (int s = 0; s < (int)(sizeof(spans) / sizeof(spans[0])); s++)
   {
     int a = kk + spans[s][0], b = kk + spans[s][1];
+    tried[s][0] = tried[s][1] = -1;
     if (a < 0 || b >= nseq)
+      continue;
+    // Words of math are single letters: take more of them, on the sides
+    // the span extends to, until the needle is as long as a few words of
+    // text.
+    int total = 0;
+    for (int m = a; m <= b; m++)
+      total += t.words[seq[m]].count;
+    while (total < SYNC_NEEDLE_MIN)
+    {
+      bool left = spans[s][0] < 0 && a > 0, right = spans[s][1] > 0 && b + 1 < nseq;
+      if (left && (!right || kk - a <= b - kk))
+        total += t.words[seq[--a]].count;
+      else if (right)
+        total += t.words[seq[++b]].count;
+      else
+        break;
+    }
+    bool seen = false;
+    for (int r = 0; r < s; r++)
+      seen |= tried[r][0] == a && tried[r][1] == b;
+    tried[s][0] = a, tried[s][1] = b;
+    if (seen)
       continue;
     int len = 0, offset = 0;
     for (int m = a; m <= b; m++)
     {
       struct sync_word *w = &t.words[seq[m]];
       if (m == kk)
-        offset = len + in_word - (after ? 1 : 0);
+        offset = len + in_word;
       memcpy(needle + len, t.chars + w->first, w->count * sizeof(int));
       memcpy(gap + len, t.gap + w->first, w->count);
       // Words of other segments in between: the page has a mark there.
@@ -895,7 +2116,8 @@ static int sync_refine_by_text(struct persistent_state *ps, ui_state *ui,
 #define SYNC_BACK_MIN_MATCH 5
 
 struct sync_char {
-  int c, line, column;
+  int c, line;
+  int column, column_end;  // the characters it stands for
   bool gap;        // material left out before this character
   int gap_column;  // where it starts
   int segment, order;
@@ -971,6 +2193,9 @@ static bool sync_backward_by_text(struct persistent_state *ps, ui_state *ui,
   fz_buffer *data = sync_file_data(ps, ui, path);
   int first_line = *line > SYNC_BACK_LINES_BEFORE ? *line - SYNC_BACK_LINES_BEFORE : 1;
   static struct sync_text t;
+  static struct sync_macros macros;
+  sync_macros_load(ps, ui, &macros);
+  t.macros = &macros;
   const char *p = data ? sync_text_begin(data, first_line, &t) : NULL;
   if (!p)
     return false;
@@ -994,9 +2219,11 @@ static bool sync_backward_by_text(struct persistent_state *ps, ui_state *ui,
       src[ns].c = t.chars[i];
       src[ns].line = l;
       src[ns].column = t.source[i];
+      src[ns].column_end = t.source_end[i];
       src[ns].gap = t.gap[i];
       // Material left out starts after the previous word of the line.
-      int g = i > 0 ? t.source[i - 1] + 1 : 0;
+      int g = i == 0 ? 0 : t.source_end[i - 1] < t.source[i]
+                                ? t.source_end[i - 1] : t.source[i];
       while (g < t.source[i] && (text[g] == ' ' || text[g] == '\t'))
         g++;
       src[ns].gap_column = g;
@@ -1077,7 +2304,8 @@ static bool sync_backward_by_text(struct persistent_state *ps, ui_state *ui,
   {
     *line = src[best].line;
     *column = best_in_gap ? src[best].gap_column
-                          : src[best].column + (after ? 1 : 0);
+              : after     ? src[best].column_end
+                          : src[best].column;
     fprintf(stderr, "[synctex backward] refined by text: line %d column %d "
             "(%d characters match%s)\n",
             *line, *column, best_score, best_in_gap ? ", in a gap" : "");

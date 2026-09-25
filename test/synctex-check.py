@@ -16,6 +16,14 @@ word gives
   the editor to the word's source line, with the cursor just before or just
   after the character.
 
+Math is checked character by character: the letters and digits written in
+formulas of the source are aligned with those of the page between aligned
+words (in the order of the page, which differs: TeX typesets a superscript
+before a subscript, an operator's upper limit before the operator). Each
+aligned character gives a forward case (the cursor before it) and a backward
+case, in the context "math" or "display" (with the context of the text
+around, as in math/caption).
+
 Usage:
   synctex-check.py [--texpresso BIN] [-I DIR]... [--chars all|ends]
                    [--jobs N] [--json OUT] [--show N] document.tex
@@ -70,7 +78,40 @@ CONTEXT_CMDS = {
 MATH_ENVS = {
     'equation', 'equation*', 'align', 'align*', 'gather', 'gather*',
     'multline', 'multline*', 'eqnarray', 'eqnarray*', 'displaymath', 'math',
+    'flalign', 'flalign*', 'alignat', 'alignat*', 'dmath', 'dmath*',
 }
+# In math, also not typeset: labels, tags (typeset with parentheses, at the
+# margin), spaces and the text of phantoms.
+MATH_SKIP_ARGS = SKIP_ARGS | {'tag', 'phantom', 'hphantom', 'vphantom'}
+# Followed by a dimension: \mkern-9mu
+MATH_DIMEN_CMDS = {'kern', 'mkern', 'hskip', 'mskip'}
+# In math, typeset without letters or digits of ASCII (Greek letters, symbols)
+# or only with those of their arguments (styles, fonts, accents). Other
+# commands (\log, macros of the document) may print letters that the source
+# does not have: the source characters around them are not aligned as one
+# block.
+MATH_SILENT_CMDS = set("""
+alpha beta gamma delta epsilon varepsilon zeta eta theta vartheta iota kappa
+lambda mu nu xi pi varpi rho varrho sigma varsigma tau upsilon phi varphi chi
+psi omega Gamma Delta Theta Lambda Xi Pi Sigma Upsilon Phi Psi Omega
+displaystyle textstyle scriptstyle scriptscriptstyle frac dfrac tfrac sqrt
+left right middle big Big bigg Bigg bigl bigr Bigl Bigr biggl biggr Biggl Biggr
+mathrm mathbf mathit mathsf mathtt mathcal mathbb mathfrak mathscr mathnormal
+boldsymbol bm text textrm textbf textit textsf texttt textnormal mbox
+operatorname operatorname* limits nolimits quad qquad hat bar tilde vec dot
+ddot check breve acute grave widehat widetilde overline underline overbrace
+underbrace overset underset stackrel xrightarrow xleftarrow color textcolor
+cdot cdots ldots dots dotsc dotsb vdots ddots times div pm mp ast star circ
+bullet leq geq le ge neq ne ll gg approx sim simeq cong equiv propto doteq
+in notin ni subset subseteq supset supseteq cup cap setminus emptyset varnothing
+wedge vee land lor neg lnot forall exists nexists implies iff mid nmid parallel
+perp top bot vert Vert lvert rvert lVert rVert langle rangle lceil rceil
+lfloor rfloor lbrace rbrace to gets mapsto rightarrow leftarrow Rightarrow
+Leftarrow leftrightarrow Leftrightarrow longrightarrow longleftarrow
+Longrightarrow uparrow downarrow sum prod coprod int iint oint bigcup bigcap
+bigoplus bigotimes bigvee bigwedge odot oplus otimes ominus oslash partial
+nabla infty prime angle triangle Box square colon not
+""".split())
 # Environments typeset as they are (comment: not at all).
 VERBATIM_ENVS = {
     'verbatim', 'verbatim*', 'Verbatim', 'Verbatim*', 'BVerbatim', 'LVerbatim',
@@ -99,8 +140,10 @@ class SourceWord:
 
 def source_words(text):
     """Words of a LaTeX source with their positions (line 1-based, columns
-    0-based, in characters) and a context tag."""
+    0-based, in characters) and a context tag, and the letters and digits of
+    its math, as words of one character."""
     words = []
+    math_chars = []
     env_stack = []        # environment names
     brace_stack = []      # command that opened each group, or None
     math = None           # closing delimiter of the current inline math
@@ -115,6 +158,12 @@ def source_words(text):
         for m in re.finditer(r'[^\W\d_]+', line[i:j]):
             words.append(SourceWord(lineno, i + m.start(), i + m.end(),
                                     m.group(0), 'verbatim'))
+
+    def in_math():
+        return math is not None or any(e in MATH_ENVS for e in env_stack)
+
+    def display():
+        return math in ('$$', '\\]') or any(e in MATH_ENVS for e in env_stack)
 
     def context():
         for name in reversed(brace_stack):
@@ -145,6 +194,8 @@ def source_words(text):
                 m = re.match(r'\\([A-Za-z@]+\*?)', line[i:])
                 if m:
                     name = m.group(1)
+                    if in_math() and skip_depth is None and name not in MATH_SILENT_CMDS:
+                        math_chars.append(SourceWord(lineno, i, i, '', 'barrier'))
                     i += len(m.group(0))
                     if name in ('begin', 'end'):
                         m2 = re.match(r'\s*\{([^}]*)\}', line[i:])
@@ -176,19 +227,22 @@ def source_words(text):
                             i = end + 1
                         pending_cmd = None
                         continue
-                    if name in ('(', '['):
-                        pass
                     if name in ('State', 'Require', 'Ensure', 'node', 'Comment'):
                         line_ctx = name
+                    if in_math() and name in MATH_DIMEN_CMDS:
+                        m2 = re.match(r'\s*[-+]?[\d.]*\s*([a-z]{2})?', line[i:])
+                        i += len(m2.group(0))
+                        name = None
                     pending_cmd = name
                     continue
                 # \( \) \[ \] and escaped characters
-                if line[i:i + 2] in ('\\(', '\\['):
+                if line[i:i + 2] in ('\\(', '\\[') and math is None:
                     math = '\\)' if line[i + 1] == '(' else '\\]'
                 elif math and line[i:i + 2] == math:
                     math = None
                 i += 2
-                pending_cmd = None
+                # \\[2pt]
+                pending_cmd = '\\' if line[i - 1:i] == '\\' else None
                 continue
             if c == '[' and pending_cmd:
                 # optional argument: skip it
@@ -205,7 +259,8 @@ def source_words(text):
                 continue
             if c == '{':
                 brace_stack.append(pending_cmd)
-                if pending_cmd in SKIP_ARGS and skip_depth is None:
+                skips = MATH_SKIP_ARGS if in_math() else SKIP_ARGS
+                if pending_cmd in skips and skip_depth is None:
                     skip_depth = len(brace_stack)
                 pending_cmd = None
                 i += 1
@@ -219,18 +274,29 @@ def source_words(text):
                 i += 1
                 continue
             if c == '$':
-                if math == '$':
+                d = '$$' if line[i:i + 2] == '$$' else '$'
+                if math == d:
                     math = None
                 elif math is None:
-                    math = '$'
+                    math = d
+                i += len(d)
+                continue
+            if in_math() and c.isascii() and c.isalnum():
+                if skip_depth is None:
+                    ctx = context()
+                    if ctx == 'text' and line_ctx:
+                        ctx = line_ctx
+                    kind = 'display' if display() else 'math'
+                    math_chars.append(SourceWord(lineno, i, i + 1, c,
+                                                 kind if ctx == 'text' else kind + '/' + ctx))
                 i += 1
+                pending_cmd = None
                 continue
             if c.isalpha():
                 j = i
                 while j < n and line[j].isalpha():
                     j += 1
-                in_math = math is not None or any(e in MATH_ENVS for e in env_stack)
-                if skip_depth is None and not in_math:
+                if skip_depth is None and not in_math():
                     ctx = context()
                     if ctx == 'text' and line_ctx:
                         ctx = line_ctx
@@ -241,7 +307,7 @@ def source_words(text):
             if not c.isspace():
                 pending_cmd = None
             i += 1
-    return words
+    return words, math_chars
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +387,28 @@ def rendered_words(page, lines):
     return words
 
 
+def rendered_chars(pages):
+    """The characters of all pages in reading order, as (page, char), without
+    the line numbers in the margins."""
+    out = []
+    for page, lines in enumerate(pages):
+        for line in lines:
+            chars = expand_chars(line['chars'], tuple(line['bbox']))
+            text = ''.join(ch.c for ch in chars).strip()
+            x0, _, x1, _ = line['bbox']
+            if text.isdigit() and (x1 < 100 or x0 > 510):
+                continue
+            out.extend((page, ch) for ch in chars)
+    return out
+
+
+def fold_char(c):
+    """A letter or digit as in math source (U+1D44E is a), else ''. The case
+    is kept: T and t are different variables."""
+    f = unicodedata.normalize('NFKC', c)
+    return f if len(f) == 1 and f.isascii() and f.isalnum() else ''
+
+
 # ---------------------------------------------------------------------------
 # Alignment
 
@@ -365,6 +453,57 @@ def align(src, ren, radius=2, min_run=3):
             match.setdefault(a + d, b + d)
     return [(src[i], ren[j]) for i, j in sorted(match.items())
             if len(src[i].text) == len(ren[j].chars)]
+
+
+def align_math(pairs, src, math_chars, chars):
+    """Pairs (source character, rendered character) of math, as words of one
+    character: between consecutive aligned words, the letters and digits of
+    the source (text and math, in source order) are aligned with those of the
+    page, keeping matching blocks of two characters or more and characters
+    found once on both sides."""
+    def key(page, ch):
+        return page, round(ch.ox, 2), round(ch.oy, 2), ch.c
+    index = {key(page, ch): k for k, (page, ch) in enumerate(chars)}
+    items = sorted([(w.line, w.start, w, False) for w in src] +
+                   [(w.line, w.start, w, True) for w in math_chars],
+                   key=lambda t: (t[0], t[1]))
+    keys = [(t[0], t[1]) for t in items]
+    import bisect
+    out = []
+    for (sa, ra), (sb, rb) in zip(pairs, pairs[1:]):
+        r0 = index.get(key(ra.page, ra.chars[-1]), -1) + 1
+        r1 = index.get(key(rb.page, rb.chars[0]), -1)
+        lo = bisect.bisect_left(keys, (sa.line, sa.end))
+        hi = bisect.bisect_left(keys, (sb.line, sb.start))
+        if r1 <= r0 or lo >= hi or not any(items[k][3] for k in range(lo, hi)):
+            continue
+        # Source characters: those of the words, and of math.
+        s_seq = []
+        for line, _, w, is_math in items[lo:hi]:
+            if is_math and w.context == 'barrier':
+                s_seq.append(('\x01', None))
+            elif is_math:
+                s_seq.append((fold_char(w.text), w))
+            else:
+                s_seq.extend((fold_char(c), None) for c in w.text)
+        s_seq = [(c, w) for c, w in s_seq if c]
+        r_seq = [(fold_char(ch.c), page, ch) for page, ch in chars[r0:r1]]
+        r_seq = [t for t in r_seq if t[0]]
+        if not s_seq or not r_seq or len(r_seq) > 4 * len(s_seq) + 40:
+            continue
+        a_str = ''.join(c for c, _ in s_seq)
+        b_str = ''.join(c for c, _, _ in r_seq)
+        sm = difflib.SequenceMatcher(None, a_str, b_str, autojunk=False)
+        for a, b, size in sm.get_matching_blocks():
+            if size == 0 or (size == 1 and (a_str.count(a_str[a]) > 1 or
+                                            b_str.count(b_str[b]) > 1)):
+                continue
+            for d in range(size):
+                w = s_seq[a + d][1]
+                if w is not None:
+                    _, page, ch = r_seq[b + d]
+                    out.append((w, RenderedWord(page, [ch])))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -508,8 +647,16 @@ def backward(v, page, x, y):
 # ---------------------------------------------------------------------------
 # Checks
 
+def is_math(word):
+    return word.context.split('/')[0] in ('math', 'display')
+
+
 def char_positions(word, mode):
     n = len(word.text)
+    if is_math(word):
+        # After a character of math is before the next one, typeset
+        # elsewhere (x^2_i).
+        return [0]
     if mode == 'all':
         return list(range(n + 1))
     return sorted({0, n // 2, n})
@@ -641,14 +788,18 @@ def main():
         print('compiled %d pages in %.1fs (%d viewers)' %
               (len(pages), time.time() - t0, len(viewers)))
 
-        src = source_words(source)
+        src, math_chars = source_words(source)
+        barriers = sum(w.context == 'barrier' for w in math_chars)
         ren = [w for p, lines in enumerate(pages) for w in rendered_words(p, lines)]
         pairs = align(src, ren)
+        math_pairs = align_math(pairs, src, math_chars, rendered_chars(pages))
+        print('%d source words, %d rendered words, %d aligned; '
+              '%d characters of math, %d aligned' %
+              (len(src), len(ren), len(pairs), len(math_chars) - barriers, len(math_pairs)))
+        pairs = sorted(pairs + math_pairs, key=lambda p: (p[0].line, p[0].start))
         if args.lines:
             a, b = map(int, args.lines.split('-'))
             pairs = [(s, r) for s, r in pairs if a <= s.line <= b]
-        print('%d source words, %d rendered words, %d aligned' %
-              (len(src), len(ren), len(pairs)))
 
         out = {}
         lines = source.split('\n')

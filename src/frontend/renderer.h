@@ -94,12 +94,15 @@ int txp_fold_char(int c);
 
 #define TXP_TEXT_MAX_GAP 64
 #define TXP_TEXT_LOOKAHEAD 5
+// Flag of a gap that can start anywhere, not only at the start of a word
+#define TXP_TEXT_GAP_ANYWHERE 0x80
 
 // Find `needle` (folded characters, see txp_fold_char) in the text of the
 // displayed page, ignoring characters that do not take part. Where gap[j]
 // > 0 (gap can be NULL), up to gap[j] (at most TXP_TEXT_MAX_GAP) characters
 // of the page that are not in the needle can come before needle[j], from
-// the start of a word: the fewest after which the next TXP_TEXT_LOOKAHEAD
+// the start of a word (anywhere if gap[j] has TXP_TEXT_GAP_ANYWHERE): the
+// fewest after which the next TXP_TEXT_LOOKAHEAD
 // characters of the needle (up to its next gap) match. With max_distance >= 0,
 // take the match nearest to `anchor` in reading order, if its character at
 // `offset` is at most max_distance characters from the one closest to the

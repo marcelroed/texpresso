@@ -1020,6 +1020,61 @@ int txp_fold_char(int c)
     "aaaaaaaceeeeiiii" "dnooooo\0ouuuuyty"; // U+00E0 .. U+00FF
   if (c >= 0xC0 && c <= 0xFF)
     return latin1[c - 0xC0];
+  if (c == 0xFFFD || (c >= 0x2B0 && c <= 0x36F))
+    // Unknown glyphs, modifier letters and combining marks (math accents)
+    return 0;
+
+  // Math letters: the letterlike symbols (double-struck, script, fraktur)
+  // and the Mathematical Alphanumeric Symbols fold to their plain letter.
+  static const struct { int c; char f; } letterlike[] = {
+    {0x2102, 'c'}, {0x210A, 'g'}, {0x210B, 'h'}, {0x210C, 'h'}, {0x210D, 'h'},
+    {0x210E, 'h'}, {0x2110, 'i'}, {0x2111, 'i'}, {0x2112, 'l'}, {0x2113, 'l'},
+    {0x2115, 'n'}, {0x2119, 'p'}, {0x211A, 'q'}, {0x211B, 'r'}, {0x211C, 'r'},
+    {0x211D, 'r'}, {0x2124, 'z'}, {0x2128, 'z'}, {0x212C, 'b'}, {0x212D, 'c'},
+    {0x212F, 'e'}, {0x2130, 'e'}, {0x2131, 'f'}, {0x2133, 'm'}, {0x2134, 'o'},
+  };
+  if (c >= 0x2102 && c <= 0x2134)
+    for (size_t i = 0; i < sizeof(letterlike) / sizeof(letterlike[0]); i++)
+      if (letterlike[i].c == c)
+        return letterlike[i].f;
+  if (c >= 0x1D400 && c <= 0x1D6A3)
+  {
+    int k = (c - 0x1D400) % 52;
+    return 'a' + (k < 26 ? k : k - 26);
+  }
+  if (c == 0x1D6A4 || c == 0x1D6A5)
+    return c == 0x1D6A4 ? 'i' : 'j';
+  if (c >= 0x1D6A8 && c <= 0x1D7C9)
+  {
+    // Greek, 58 characters per style: capitals (with the theta symbol at
+    // the place of the missing final sigma), nabla, small letters, partial
+    // and the variant forms.
+    static const int variants[] = {0x3B5, 0x3B8, 0x3BA, 0x3C6, 0x3C1, 0x3C0};
+    int k = (c - 0x1D6A8) % 58;
+    if (k == 17)
+      return 0x3B8;
+    if (k < 25)
+      return fz_tolower(0x391 + k);
+    if (k == 25 || k == 51)
+      return 0;
+    if (k < 51)
+      return txp_fold_char(0x3B1 + k - 26);
+    return variants[k - 52];
+  }
+  if (c >= 0x1D7CE && c <= 0x1D7FF)
+    return '0' + (c - 0x1D7CE) % 10;
+
+  switch (c)
+  {
+    // Variant forms of Greek letters
+    case 0x3C2: return 0x3C3;
+    case 0x3D1: case 0x3F4: return 0x3B8;
+    case 0x3D5: return 0x3C6;
+    case 0x3D6: return 0x3C0;
+    case 0x3F0: return 0x3BA;
+    case 0x3F1: return 0x3C1;
+    case 0x3F5: return 0x3B5;
+  }
   if ((c >= 0x2000 && c <= 0x2BFF) || (c >= 0xE000 && c <= 0xF8FF) ||
       (c >= 0xFE00 && c <= 0xFE0F))
     return 0;
@@ -1028,8 +1083,8 @@ int txp_fold_char(int c)
 
 struct text_char {
   int c;
-  // First of a line, after a space or punctuation, or raised or lowered
-  // (the mark of a footnote)
+  // First of a line, after a space or punctuation, raised or lowered (the
+  // mark of a footnote, the scripts of math) or in another font
   bool word_start;
   fz_point origin;
   fz_rect char_box, line_box;
@@ -1063,7 +1118,8 @@ static struct text_char *page_text(fz_context *ctx, txp_renderer *self, int *cou
           continue;
         }
         if (prev && (fabsf(ch->origin.y - prev->origin.y) > 0.5f ||
-                     fabsf(ch->size - prev->size) > 0.5f))
+                     fabsf(ch->size - prev->size) > 0.5f ||
+                     ch->font != prev->font))
           word_start = true;
         if (n == cap)
         {
@@ -1126,7 +1182,7 @@ struct text_match {
 // text before needle[j] (the fewest after which the needle goes on
 // matching). What a macro typesets starts a word: the text skipped cannot
 // start in the middle of one (as "heading" matching the beginning of
-// "headings").
+// "headings"), unless the gap has TXP_TEXT_GAP_ANYWHERE (math).
 static bool match_at(const struct text_char *text, int n, int i,
                      const int *needle, const unsigned char *gap, int len,
                      int offset, struct text_match *m)
@@ -1138,7 +1194,8 @@ static bool match_at(const struct text_char *text, int n, int i,
   {
     if (j > 0 && gap && gap[j])
     {
-      int k = 0, max_gap = i < n && text[i].word_start ? gap[j] : 0;
+      bool start = i < n && (text[i].word_start || (gap[j] & TXP_TEXT_GAP_ANYWHERE));
+      int k = 0, max_gap = start ? gap[j] & ~TXP_TEXT_GAP_ANYWHERE : 0;
       while (k <= max_gap &&
              !match_ahead(text, n, i + k, needle, gap, len, j))
         k++;
