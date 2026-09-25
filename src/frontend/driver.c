@@ -330,8 +330,12 @@ int main(int argc, const char **argv)
 #endif
   SDL_FreeSurface(logo);
 
+  // Without a display (SDL_VIDEODRIVER=dummy, for tests), waiting for vsync
+  // only slows down each frame.
+  const char *video = SDL_GetCurrentVideoDriver();
+  Uint32 vsync = video && strcmp(video, "dummy") == 0 ? 0 : SDL_RENDERER_PRESENTVSYNC;
   SDL_Renderer *renderer;
-  renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_PRESENTVSYNC | SDL_RENDERER_TARGETTEXTURE);
+  renderer = SDL_CreateRenderer(window, -1, vsync | SDL_RENDERER_TARGETTEXTURE);
 
   struct persistent_state pstate = {
       .initial = {0,},
