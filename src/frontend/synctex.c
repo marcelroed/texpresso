@@ -750,6 +750,14 @@ static int get_input(fz_buffer *buf,
   return (fend - filename);
 }
 
+int synctex_input_name(synctex_t *stx, fz_buffer *buf, int tag, const char **name)
+{
+  *name = NULL;
+  if (!stx || !buf || tag <= 0 || tag > stx->input_off.len)
+    return 0;
+  return get_input(buf, stx, tag - 1, name);
+}
+
 bool synctex_scan(fz_context *ctx,
                   synctex_t *stx,
                   fz_buffer *buf,

@@ -1271,9 +1271,33 @@ dvi_exec_pdf(fz_context *ctx, dvi_context *dc, dvi_state *st, cursor_t cur, curs
   */
 }
 
+// "txp:tag,line,column[,length]" or "txp:0": source position of the next
+// glyph (see dvi_srcmap)
+static bool txp_glyph_src(dvi_context *dc, cursor_t cur, cursor_t lim)
+{
+  int v[4] = {0, 0, 0, 1}, n = 0;
+  while (n < 4 && cur < lim)
+  {
+    int x = 0;
+    while (cur < lim && *cur >= '0' && *cur <= '9')
+      x = x * 10 + (*cur++ - '0');
+    v[n++] = x;
+    if (cur < lim && *cur == ',')
+      cur++;
+    else
+      break;
+  }
+  if (dc->srcmap)
+    dvi_srcmap_set(dc->srcmap, n >= 3 ? v[0] : 0, v[1], v[2], v[3]);
+  return 1;
+}
+
 bool dvi_exec_special(fz_context *ctx, dvi_context *dc, dvi_state *st, cursor_t cur, cursor_t lim)
 {
   cursor_t mar, i, j;
+
+  if (lim - cur >= 4 && memcmp(cur, "txp:", 4) == 0)
+    return txp_glyph_src(dc, cur + 4, lim);
 
   // fprintf(stderr, "special: %.*s\n", (int)(lim - cur), cur);
 

@@ -93,6 +93,10 @@ int32_t two_to_the[31];
 int32_t spec_log[29];
 int32_t temp_ptr;
 memory_word *mem;
+uint64_t *txp_src;
+uint64_t txp_cur_src;
+uint64_t txp_prev_src;
+uint64_t txp_src_override;
 int32_t lo_mem_max;
 int32_t hi_mem_min;
 int32_t var_used, dyn_used;
@@ -1431,11 +1435,14 @@ prefixed_command(void)
                     get_token();
             }
         } else {
+            uint64_t q_src;
             get_token();
             q = cur_tok;
+            q_src = txp_cur_src;
             get_token();
             back_input();
             cur_tok = q;
+            txp_cur_src = q_src;
             back_input();
         }
 
@@ -2538,6 +2545,7 @@ load_fmt_file(void)
     cur_list.tail = CONTRIB_HEAD;
     page_tail = PAGE_HEAD;
     mem = xmalloc_array(memory_word, MEM_TOP + 1);
+    txp_src = xcalloc(MEM_TOP + 1, sizeof(uint64_t));
 
     undump_int(x);
     if (x != EQTB_SIZE)
@@ -3626,6 +3634,7 @@ tt_run_engine(const char *dump_name, const char *input_file_name, time_t build_d
 
     if (in_initex_mode) {
         mem = xmalloc_array(memory_word, MEM_TOP + 1);
+        txp_src = xcalloc(MEM_TOP + 1, sizeof(uint64_t));
         eqtb_top = EQTB_SIZE + hash_extra;
 
         if (hash_extra == 0)

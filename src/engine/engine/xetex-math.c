@@ -1648,6 +1648,7 @@ clean_box(int32_t p, small_number s)
         {
             cur_mlist = new_noad();
             mem[cur_mlist + 1] = mem[p];
+            txp_src[cur_mlist + 1] = txp_src[p];
         }
         break;
     case 2:
@@ -1704,6 +1705,8 @@ found:
 static void
 fetch(int32_t a)
 {
+    if (txp_src[a])
+        txp_src_override = txp_src[a];
     cur_c = (unsigned short) mem[a].b16.s0;
     cur_f = MATH_FONT((mem[a].b16.s1 % 256) + cur_size);
     cur_c = cur_c + (mem[a].b16.s1 / 256) * 65536L;
@@ -1951,6 +1954,9 @@ make_math_accent(int32_t q)
                 mem[x + 1] = mem[q + 1];
                 mem[x + 2] = mem[q + 2];
                 mem[x + 3] = mem[q + 3];
+                txp_src[x + 1] = txp_src[q + 1];
+                txp_src[x + 2] = txp_src[q + 2];
+                txp_src[x + 3] = txp_src[q + 3];
                 mem[q + 2].b32 = empty;
                 mem[q + 3].b32 = empty;
                 mem[q + 1].b32.s1 = SUB_MLIST;
@@ -2362,6 +2368,8 @@ restart:
                                                             mem[q + 1].b16.s0 = cur_i.s0;
                                                             mem[q + 3] = mem[p + 3];
                                                             mem[q + 2] = mem[p + 2];
+                                                            txp_src[q + 3] = txp_src[p + 3];
+                                                            txp_src[q + 2] = txp_src[p + 2];
                                                             free_node(p, NOAD_SIZE);
                                                         }
                                                         break;
@@ -2899,8 +2907,19 @@ make_left_right(int32_t q, small_number style, scaled_t max_d, scaled_t max_h)
 }
 
 
+static void mlist_to_hlist_(void);
+
+/* Characters built from a noad take the position of its field (see fetch). */
 static void
 mlist_to_hlist(void)
+{
+    uint64_t save = txp_src_override;
+    mlist_to_hlist_();
+    txp_src_override = save;
+}
+
+static void
+mlist_to_hlist_(void)
 {
     int32_t mlist;
     bool penalties;
@@ -3381,6 +3400,9 @@ var_delimiter(int32_t d, int32_t s, scaled_t v)
     b16x4 r;
     int32_t z;
     bool large_attempt;
+
+    if (txp_src[d])
+        txp_src_override = txp_src[d];
 
     f = FONT_BASE;
     w = 0;

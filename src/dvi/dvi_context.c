@@ -65,6 +65,11 @@ void dvi_context_free(fz_context *ctx, dvi_context *dc)
     fz_free(ctx, dc->links->dests);
     fz_free(ctx, dc->links);
   }
+  if (dc->srcmap)
+  {
+    fz_free(ctx, dc->srcmap->glyphs);
+    fz_free(ctx, dc->srcmap);
+  }
   dvi_context_set_device(ctx, dc, NULL);
   dvi_resmanager_free(ctx, dc->resmanager);
   dvi_scratch_release(ctx, &dc->scratch);
@@ -89,6 +94,8 @@ void dvi_context_begin_frame(fz_context *ctx, dvi_context *dc, fz_device *dev)
 
   if (dc->links)
     dvi_links_clear(ctx, dc->links);
+  if (dc->srcmap)
+    dvi_srcmap_clear(dc->srcmap);
 }
 
 void dvi_context_end_frame(fz_context *ctx, dvi_context *dc)
@@ -210,4 +217,40 @@ void dvi_links_add_glyph(fz_context *ctx, dvi_links *l, fz_rect box)
   }
   else
     l->rect = fz_union_rect(l->rect, box);
+}
+
+/* Source positions of glyphs */
+
+void dvi_srcmap_clear(dvi_srcmap *m)
+{
+  m->tag = m->line = m->column = 0;
+  m->length = 1;
+  m->count = 0;
+}
+
+void dvi_srcmap_set(dvi_srcmap *m, int tag, int line, int column, int length)
+{
+  m->tag = tag;
+  m->line = line;
+  m->column = column;
+  m->length = length;
+}
+
+void dvi_srcmap_add(fz_context *ctx, dvi_srcmap *m, fz_point origin, fz_point end, fz_rect box)
+{
+  if (m->tag > 0)
+  {
+    if (m->count == m->cap)
+    {
+      int cap = m->cap ? m->cap * 2 : 1024;
+      m->glyphs = fz_realloc_array(ctx, m->glyphs, cap, dvi_glyph_src);
+      m->cap = cap;
+    }
+    m->glyphs[m->count++] = (dvi_glyph_src){
+      .tag = m->tag, .line = m->line, .column = m->column,
+      .length = m->length, .origin = origin, .end = end, .box = box,
+    };
+  }
+  m->column += m->length;
+  m->length = 1;
 }

@@ -36,7 +36,8 @@ struct incdvi_s
   int page_len, page_cap;
   int *pages;
   dvi_context *dc;
-  // Page whose links are in dc->links, or -1
+  // Page whose links and glyph sources are in dc->links and dc->srcmap,
+  // or -1
   int links_page;
 };
 
@@ -68,6 +69,7 @@ incdvi_t *incdvi_new(fz_context *ctx, dvi_reshooks hooks)
   incdvi_t *d = fz_malloc_struct(ctx, incdvi_t);
   d->dc = dvi_context_new(ctx, hooks);
   d->dc->links = fz_malloc_struct(ctx, dvi_links);
+  d->dc->srcmap = fz_malloc_struct(ctx, dvi_srcmap);
   d->links_page = -1;
   return d;
 }
@@ -217,7 +219,8 @@ void incdvi_render_page(fz_context *ctx, incdvi_t *d, fz_buffer *buf, int page, 
   d->links_page = page;
 }
 
-// Make sure dc->links holds the links of a page
+// Make sure dc->links and dc->srcmap hold the links and glyph sources of a
+// page
 static void collect_links(fz_context *ctx, incdvi_t *d, fz_buffer *buf, int page)
 {
   if (d->links_page == page)
@@ -270,6 +273,17 @@ bool incdvi_find_dest(fz_context *ctx, incdvi_t *d, fz_buffer *buf,
       }
   }
   return 0;
+}
+
+int incdvi_glyph_srcs(fz_context *ctx, incdvi_t *d, fz_buffer *buf, int page,
+                      const dvi_glyph_src **glyphs)
+{
+  *glyphs = NULL;
+  if (page < 0 || page >= incdvi_page_count(d))
+    return 0;
+  collect_links(ctx, d, buf, page);
+  *glyphs = d->dc->srcmap->glyphs;
+  return d->dc->srcmap->count;
 }
 
 float incdvi_tex_scale_factor(incdvi_t *d)

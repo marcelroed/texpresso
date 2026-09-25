@@ -188,6 +188,7 @@ int32_t get_avail(void)
         }
     }
     mem[p].b32.s1 = TEX_NULL;
+    txp_src[p] = TXP_SRC_NOW();
     return p;
 }
 
@@ -276,6 +277,8 @@ restart:
 
 found:
     mem[r].b32.s1 = TEX_NULL;
+    for (t = 0; t < s; t++)
+        txp_src[r + t] = TXP_SRC_NOW();
     if (s >= MEDIUM_NODE_SIZE) {
         mem[r + s - 1].b32.s0 = cur_input.synctex_tag;
         mem[r + s - 1].b32.s1 = synctex_line_and_column();
@@ -1631,6 +1634,7 @@ copy_node_list(int32_t p)
         while (words > 0) {
             words--;
             mem[r + words] = mem[p + words];
+            txp_src[r + words] = txp_src[p + words];
         }
 
         mem[q].b32.s1 = r;
@@ -4896,6 +4900,8 @@ begin_token_list(int32_t p, uint16_t t)
     cur_input.state = TOKEN_LIST;
     cur_input.start = p;
     cur_input.index = t;
+    /* The output routine runs at arbitrary points: its material has no source. */
+    cur_input.txp_src = t == OUTPUT_TEXT ? 0 : txp_cur_src;
 
     if (t >= MACRO) {
         mem[p].b32.s0++;
@@ -4968,6 +4974,7 @@ void back_input(void)
         end_token_list();
     p = get_avail();
     mem[p].b32.s0 = cur_tok;
+    txp_src[p] = txp_cur_src;
     if (cur_tok < RIGHT_BRACE_LIMIT) {
 
         if (cur_tok < LEFT_BRACE_LIMIT)
@@ -4988,6 +4995,9 @@ void back_input(void)
     cur_input.start = p;
     cur_input.index = BACKED_UP;
     cur_input.loc = p;
+    /* A token read ahead (the space after a number, the look-ahead of a
+     * macro) is not yet there: what comes before it is. */
+    txp_cur_src = txp_prev_src;
 }
 
 void
@@ -5165,6 +5175,9 @@ get_next(void)
     UTF16_code lower;
     small_number d;
     small_number sup_count;
+    int32_t txp_tok_start = 0;
+
+    txp_prev_src = txp_cur_src;
 
 restart:
     cur_cs = 0;
@@ -5172,6 +5185,7 @@ restart:
 
     if (cur_input.state != TOKEN_LIST) { /*355:*/
     texswitch:
+        txp_tok_start = cur_input.loc;
         if (cur_input.loc <= cur_input.limit) {
             cur_chr = buffer[cur_input.loc];
             cur_input.loc++;
@@ -5587,6 +5601,26 @@ restart:
             goto texswitch;
         }
     } else if (cur_input.loc != TEX_NULL) { /* if we're inputting from a non-null token list: */
+        {
+            /* Tokens of macro bodies and token registers take the position
+             * of the call site; stored lists (arguments, backed-up and
+             * inserted tokens, templates, marks) keep their own. So do
+             * tokens of the file of the call that follow it (arguments
+             * stored in a macro), and those that a macro called by a package
+             * holds: text of the document that the package stored (\title
+             * in \@title, expanded by \maketitle). Tokens of other files
+             * are flagged TXP_SRC_INDIRECT. */
+            uint64_t s = txp_src[cur_input.loc], call = cur_input.txp_src;
+            if (cur_input.index >= MACRO && cur_input.index != MARK_TEXT) {
+                bool same = s && call && TXP_SRC_TAG(s) == TXP_SRC_TAG(call);
+                if (!same)
+                    s = call ? TXP_SRC_POS(call) | TXP_SRC_INDIRECT : 0;
+                else if (!(call & TXP_SRC_INDIRECT) && TXP_SRC_POS(s) < TXP_SRC_POS(call))
+                    s = call;
+            } else if (s == 0)
+                s = call;
+            txp_cur_src = s;
+        }
         t = mem[cur_input.loc].b32.s0;
         cur_input.loc = LLIST_link(cur_input.loc);
 
@@ -5633,6 +5667,10 @@ restart:
         goto restart;
     }
 
+    if (cur_input.state != TOKEN_LIST)
+        txp_cur_src = cur_input.synctex_tag > 0 ?
+            TXP_SRC(cur_input.synctex_tag, line, txp_tok_start - cur_input.start) : 0;
+
     if (cur_cmd <= CAR_RET && cur_cmd >= TAB_MARK && align_state == 0) { /*818:*/
         if (scanner_status == ALIGNING || cur_align == TEX_NULL)
             fatal_error("(interwoven alignment preambles are not allowed)");
@@ -5678,6 +5716,12 @@ macro_call(void)
     small_number save_scanner_status;
     int32_t save_warning_index;
     UTF16_code match_chr;
+
+    uint64_t txp_call_src = txp_cur_src;
+    /* Positions of the tokens matching the start of a delimiter: they go back
+     * to the argument when the match breaks (`\' of `\end{verbatim}') */
+    uint64_t txp_match[64];
+    unsigned txp_match_head = 0, txp_match_tail = 0;
 
     save_scanner_status = scanner_status;
     save_warning_index = warning_index;
@@ -5740,11 +5784,13 @@ macro_call(void)
                 p = TEMP_HEAD;
                 m = 0;
             }
+            txp_match_head = txp_match_tail = 0;
 
         continue_:
             get_token();
 
             if (cur_tok == mem[r].b32.s0) { /*412:*/
+                txp_match[txp_match_tail++ & 63] = TXP_SRC_NOW();
                 r = LLIST_link(r);
                 if (mem[r].b32.s0 >= MATCH_TOKEN && mem[r].b32.s0 <= END_MATCH_TOKEN) {
                     if (cur_tok < LEFT_BRACE_LIMIT)
@@ -5773,6 +5819,8 @@ macro_call(void)
 
                     do {
                         q = get_avail();
+                        if (txp_match_head != txp_match_tail)
+                            txp_src[q] = txp_match[txp_match_head++ & 63];
                         mem[p].b32.s1 = q;
                         mem[q].b32.s0 = mem[t].b32.s0;
                         p = q;
@@ -5786,6 +5834,7 @@ macro_call(void)
                                 if (cur_tok != mem[v].b32.s0) {
                                     goto done;
                                 } else {
+                                    txp_match[txp_match_tail++ & 63] = TXP_SRC_NOW();
                                     r = mem[v].b32.s1;
                                     goto continue_;
                                 }
@@ -5803,6 +5852,7 @@ macro_call(void)
                     } while (t != r);
 
                     r = s;
+                    txp_match_head = txp_match_tail = 0;
                 }
             }
 
@@ -5846,6 +5896,7 @@ macro_call(void)
 
                         mem[p].b32.s1 = q;
                         mem[q].b32.s0 = cur_tok;
+                        txp_src[q] = TXP_SRC_NOW();
                         p = q;
 
                         get_token();
@@ -5972,6 +6023,7 @@ macro_call(void)
         end_token_list();
 
     begin_token_list(ref_count, MACRO);
+    cur_input.txp_src = txp_call_src;
     cur_input.name = warning_index;
     cur_input.loc = mem[r].b32.s1;
 
@@ -6215,14 +6267,17 @@ reswitch:
 
         case EXPAND_AFTER: /*385:*/
             if (cur_chr == 0) {
+                uint64_t t_src;
                 get_token();
                 t = cur_tok;
+                t_src = txp_cur_src;
                 get_token();
                 if (cur_cmd > MAX_COMMAND)
                     expand();
                 else
                     back_input();
                 cur_tok = t;
+                txp_cur_src = t_src;
                 back_input();
             } else { /*1553: "\unless" implementation */
                 get_token();
@@ -6812,6 +6867,7 @@ reswitch:
     }
     mem[p].b32.s1 = MATH_CHAR;
     mem[p].b16.s0 = c % 65536L;
+    txp_src[p] = TXP_SRC_NOW();
     if ((math_class(c) == 7)
         && ((INTPAR(cur_fam) >= 0)
             && (INTPAR(cur_fam) < NUMBER_MATH_FAMILIES)))
@@ -9185,6 +9241,7 @@ str_toks_cat(pool_pointer b, small_number cat)
 
         LLIST_link(p) = q;
         LLIST_info(q) = t;
+        txp_src[q] = TXP_SRC_NOW();
         p = q;
         k++;
     }
@@ -9252,6 +9309,7 @@ int32_t the_toks(void)
                     }
                     mem[p].b32.s1 = q;
                     mem[q].b32.s0 = mem[r].b32.s0;
+                    txp_src[q] = txp_src[r];
                     p = q;
                 }
                 r = LLIST_link(r);
@@ -16891,6 +16949,7 @@ handle_right_brace(void)
                     if (mem[p + 3].b32.s1 == EMPTY) {
                         if (mem[p + 2].b32.s1 == EMPTY) {
                             mem[save_stack[save_ptr + 0].b32.s1].b32 = mem[p + 1].b32;
+                            txp_src[save_stack[save_ptr + 0].b32.s1] = txp_src[p + 1];
                             free_node(p, NOAD_SIZE);
                         }
                     }
@@ -17997,6 +18056,7 @@ collected:
             avail = mem[lig_stack].b32.s1;
             mem[lig_stack].b32.s1 = TEX_NULL;
         }
+        txp_src[lig_stack] = TXP_SRC_NOW();
     }
 
     mem[lig_stack].b16.s1 = main_f;
@@ -18172,6 +18232,7 @@ main_loop_lookahead_1:
             avail = mem[lig_stack].b32.s1;
             mem[lig_stack].b32.s1 = TEX_NULL;
         }
+        txp_src[lig_stack] = TXP_SRC_NOW();
     }
 
     mem[lig_stack].b16.s1 = main_f;

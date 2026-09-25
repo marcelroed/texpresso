@@ -48,4 +48,9 @@ fz_link *incdvi_load_links(fz_context *ctx, incdvi_t *d, fz_buffer *buf, int pag
 bool incdvi_find_dest(fz_context *ctx, incdvi_t *d, fz_buffer *buf,
                       const char *name, int *page, fz_point *pt);
 
+// Source positions of the glyphs of a page (see dvi_srcmap), in document
+// space and page order. They are valid until the next page is interpreted.
+int incdvi_glyph_srcs(fz_context *ctx, incdvi_t *d, fz_buffer *buf, int page,
+                      const dvi_glyph_src **glyphs);
+
 #endif /*!INCDVI_H*/

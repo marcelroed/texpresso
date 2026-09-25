@@ -14,6 +14,8 @@
 #include "xetex-xetexd.h"
 #include "tectonic_bridge_core.h"
 
+static uint64_t hsrc[4097];
+
 #define AWFUL_BAD 0x3FFFFFFF
 
 #define VERY_LOOSE_FIT 0
@@ -564,6 +566,7 @@ line_break(bool d)
                                     hb = s;
                                     hn++;
                                     hu[hn] = c;
+                                    hsrc[hn] = txp_src[s];
                                     hc[hn] = hc[0];
                                     hyf_bchar = TOO_BIG_CHAR;
                                 } else if (NODE_type(s) == LIGATURE_NODE) {
@@ -597,6 +600,7 @@ line_break(bool d)
 
                                         j++;
                                         hu[j] = c;
+                                        hsrc[j] = txp_src[q];
                                         hc[j] = hc[0];
                                         q = LLIST_link(q);
                                     }
@@ -2210,6 +2214,7 @@ found1:
                 init_list = ha;
                 init_lig = false;
                 hu[0] = mem[ha].b16.s0;
+                hsrc[0] = txp_src[ha];
             }
         } else if (NODE_type(ha) == LIGATURE_NODE) {
 
@@ -2221,6 +2226,7 @@ found1:
                 init_lig = true;
                 init_lft = (mem[ha].b16.s0 > 1);
                 hu[0] = mem[ha + 1].b16.s0;
+                hsrc[0] = mem[ha + 1].b32.s1 != TEX_NULL ? txp_src[mem[ha + 1].b32.s1] : 0;
                 if (init_list == TEX_NULL) {
 
                     if (init_lft) {
@@ -2293,6 +2299,7 @@ found1:
                         i++;
                         c = hu[i];
                         hu[i] = hyf_char;
+                        hsrc[i] |= TXP_SRC_INSERTED;
                         {
                             mem[hyf_node].b32.s1 = avail;
                             avail = hyf_node;
@@ -2313,6 +2320,7 @@ found1:
                     }
                     if (hyf_node != TEX_NULL) {
                         hu[i] = c;
+                        hsrc[i] &= ~TXP_SRC_INSERTED;
                         l = i;
                         i--;
                     }
@@ -2427,6 +2435,7 @@ reconstitute(small_number j, small_number n, int32_t bchar, int32_t hchar)
                 t = LLIST_link(t);
                 mem[t].b16.s1 = hf;
                 mem[t].b16.s0 = mem[p].b16.s0;
+                txp_src[t] = txp_src[p];
             }
             p = LLIST_link(p);
         }
@@ -2435,6 +2444,7 @@ reconstitute(small_number j, small_number n, int32_t bchar, int32_t hchar)
         t = LLIST_link(t);
         mem[t].b16.s1 = hf;
         mem[t].b16.s0 = cur_l;
+        txp_src[t] = hsrc[j];
     }
     lig_stack = TEX_NULL;
     {
@@ -2522,6 +2532,7 @@ continue_:
                                         p = get_avail();
                                         mem[lig_stack + 1].b32.s1 = p;
                                         mem[p].b16.s0 = hu[j + 1];
+                                        txp_src[p] = hsrc[j + 1];
                                         mem[p].b16.s1 = hf;
                                     }
                                 }
@@ -2593,6 +2604,7 @@ continue_:
                                         t = LLIST_link(t);
                                         mem[t].b16.s1 = hf;
                                         mem[t].b16.s0 = cur_r;
+                                        txp_src[t] = hsrc[j + 1];
                                     }
                                     j++;
                                     {

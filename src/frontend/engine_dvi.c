@@ -78,6 +78,13 @@ static bool engine_resolve_link(txp_engine *_self, fz_context *ctx,
   return incdvi_find_dest(ctx, self->dvi, self->buffer, uri + 1, page, pt);
 }
 
+static int engine_glyph_srcs(txp_engine *_self, fz_context *ctx, int page,
+                             const dvi_glyph_src **glyphs)
+{
+  SELF;
+  return incdvi_glyph_srcs(ctx, self->dvi, self->buffer, page, glyphs);
+}
+
 static bool engine_step(txp_engine *_self,
                         fz_context *ctx,
                         bool restart_if_needed)

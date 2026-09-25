@@ -23,9 +23,11 @@
  */
 
 #include "renderer.h"
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 static float clampf(float x, float min, float max)
@@ -1109,6 +1111,7 @@ static struct text_char *page_text(fz_context *ctx, txp_renderer *self, int *cou
     {
       bool word_start = true;
       fz_stext_char *prev = NULL;
+      int line_start = n;
       for (fz_stext_char *ch = l->first_char; ch; prev = ch, ch = ch->next)
       {
         int c = txp_fold_char(ch->c);
@@ -1133,6 +1136,29 @@ static struct text_char *page_text(fz_context *ctx, txp_renderer *self, int *cou
         text[n].line_box = l->bbox;
         n++;
         word_start = false;
+      }
+      // MuPDF decomposes a ligature into its first character with the
+      // whole glyph and the others with no width at its end: split the
+      // glyph evenly.
+      for (int i = line_start; i < n;)
+      {
+        fz_rect *b0 = &text[i].char_box;
+        int j = i + 1;
+        while (j < n && b0->x1 > b0->x0 &&
+               text[j].char_box.x0 == b0->x1 && text[j].char_box.x1 == b0->x1 &&
+               (text[j].c > 127 || isalpha(text[j].c)))
+          j++;
+        if (j > i + 1)
+        {
+          float x0 = b0->x0, w = (b0->x1 - b0->x0) / (j - i), ox = text[i].origin.x;
+          for (int k = i; k < j; k++)
+          {
+            text[k].char_box.x0 = x0 + (k - i) * w;
+            text[k].char_box.x1 = x0 + (k - i + 1) * w;
+            text[k].origin.x = ox + (k - i) * w;
+          }
+        }
+        i = j;
       }
     }
   }
@@ -1311,6 +1337,59 @@ bool txp_renderer_find_text(fz_context *ctx, txp_renderer *self,
   }
   fz_free(ctx, text);
   return best >= 0;
+}
+
+bool txp_renderer_nearest_char(fz_context *ctx, txp_renderer *self, fz_point pt,
+                               fz_rect *char_box, fz_rect *line_box,
+                               fz_point *origin)
+{
+  int n;
+  struct text_char *text = page_text(ctx, self, &n);
+  int best = -1;
+  float d = INFINITY;
+  for (int i = 0; i < n; i++)
+  {
+    float di = text_char_distance(&text[i], pt);
+    if (di < d)
+    {
+      d = di;
+      best = i;
+    }
+  }
+  if (best >= 0)
+  {
+    *char_box = text[best].char_box;
+    *line_box = text[best].line_box;
+    if (origin)
+      *origin = text[best].origin;
+  }
+  fz_free(ctx, text);
+  return best >= 0;
+}
+
+bool txp_renderer_char_before(fz_context *ctx, txp_renderer *self, fz_point pt,
+                               fz_rect *char_box)
+{
+  int n;
+  struct text_char *text = page_text(ctx, self, &n);
+  int best = -1;
+  float d = INFINITY;
+  for (int i = 0; i < n; i++)
+  {
+    float di = text_char_distance(&text[i], pt);
+    if (di < d)
+    {
+      d = di;
+      best = i;
+    }
+  }
+  bool found = best > 0 &&
+               memcmp(&text[best - 1].line_box, &text[best].line_box,
+                      sizeof(fz_rect)) == 0;
+  if (found)
+    *char_box = text[best - 1].char_box;
+  fz_free(ctx, text);
+  return found;
 }
 
 int txp_renderer_text_at(fz_context *ctx, txp_renderer *self, fz_point pt,

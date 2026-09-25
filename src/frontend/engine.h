@@ -74,6 +74,10 @@ struct txp_engine_class
   fz_link *(*load_links)(txp_engine *self, fz_context *ctx, int page);
   bool (*resolve_link)(txp_engine *self, fz_context *ctx, const char *uri,
                        int *page, fz_point *pt);
+  // Source positions of the glyphs of a page (see dvi_srcmap), valid until
+  // the next call or rendering. 0 when the engine has none.
+  int (*glyph_srcs)(txp_engine *self, fz_context *ctx, int page,
+                    const dvi_glyph_src **glyphs);
   txp_engine_status (*get_status)(txp_engine *self);
   float (*scale_factor)(txp_engine *self);
   synctex_t *(*synctex)(txp_engine *self, fz_buffer **buf);
@@ -100,6 +104,8 @@ struct txp_engine_class
   static bool engine_resolve_link(txp_engine *_self, fz_context *ctx,       \
                                   const char *uri, int *page,               \
                                   fz_point *pt);                            \
+  static int engine_glyph_srcs(txp_engine *_self, fz_context *ctx,         \
+                               int page, const dvi_glyph_src **glyphs);     \
   static txp_engine_status engine_get_status(txp_engine *_self);            \
   static float engine_scale_factor(txp_engine *_self);                      \
   static synctex_t *engine_synctex(txp_engine *_self, fz_buffer **buf);     \
@@ -120,6 +126,7 @@ struct txp_engine_class
       .render_page = engine_render_page,                                    \
       .load_links = engine_load_links,                                      \
       .resolve_link = engine_resolve_link,                                  \
+      .glyph_srcs = engine_glyph_srcs,                                      \
       .get_status = engine_get_status,                                      \
       .scale_factor = engine_scale_factor,                                  \
       .synctex = engine_synctex,                                            \

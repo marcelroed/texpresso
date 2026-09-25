@@ -357,6 +357,35 @@ void dvi_links_end(fz_context *ctx, dvi_links *l);
 void dvi_links_add_dest(fz_context *ctx, dvi_links *l, const char *name, fz_point pt);
 void dvi_links_add_glyph(fz_context *ctx, dvi_links *l, fz_rect box);
 
+// Source positions of glyphs, from the "txp:" specials of the TeXpresso
+// engine (see txp_glyph_src in xetex-shipout.c). A special gives the synctex
+// tag, line and column of the next glyph, and how many source characters it
+// stands for (0 for inserted hyphens, several for ligatures); without one, a
+// glyph stands for one character after those of the previous glyph.
+// Coordinates are in document space.
+
+typedef struct
+{
+  int tag, line, column, length;
+  // Ends of the glyph on its baseline, and its box (at least as high as a
+  // line of text)
+  fz_point origin, end;
+  fz_rect box;
+} dvi_glyph_src;
+
+typedef struct
+{
+  // Position of the next glyph (tag 0: unknown)
+  int tag, line, column, length;
+
+  dvi_glyph_src *glyphs;
+  int count, cap;
+} dvi_srcmap;
+
+void dvi_srcmap_clear(dvi_srcmap *m);
+void dvi_srcmap_set(dvi_srcmap *m, int tag, int line, int column, int length);
+void dvi_srcmap_add(fz_context *ctx, dvi_srcmap *m, fz_point origin, fz_point end, fz_rect box);
+
 // Shared data common to DVI interpreter and renderer
 typedef struct
 {
@@ -377,6 +406,8 @@ typedef struct
 
   // When not NULL, links and destinations are collected here
   dvi_links *links;
+  // When not NULL, source positions of glyphs are collected here
+  dvi_srcmap *srcmap;
 } dvi_context;
 
 #define DC_ALLOC(ctx, dc, type, count) ((type*)dvi_scratch_alloc(ctx, &(dc)->scratch, sizeof(type) * (count)))

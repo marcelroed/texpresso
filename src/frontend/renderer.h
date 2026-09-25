@@ -125,6 +125,19 @@ bool txp_renderer_find_text(fz_context *ctx, txp_renderer *self,
 int txp_renderer_text_at(fz_context *ctx, txp_renderer *self, fz_point pt,
                          int radius, int *out, int *index, bool *after);
 
+// The character of the text of the current contents nearest to pt: its box,
+// that of its line and its origin (if not NULL). Returns false if there is no
+// text.
+bool txp_renderer_nearest_char(fz_context *ctx, txp_renderer *self, fz_point pt,
+                               fz_rect *char_box, fz_rect *line_box,
+                               fz_point *origin);
+
+// The character of the text of the current contents before the one nearest
+// to pt, on the same line (spaces are left out): its box. Returns false if
+// the one nearest to pt starts its line.
+bool txp_renderer_char_before(fz_context *ctx, txp_renderer *self, fz_point pt,
+                              fz_rect *char_box);
+
 // Testing: write the text of the current contents as JSON, one entry per
 // text line with the code point, box and origin of each character, in
 // document units.

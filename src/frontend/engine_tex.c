@@ -1189,6 +1189,18 @@ static bool engine_resolve_link(txp_engine *_self, fz_context *ctx,
   return incdvi_find_dest(ctx, self->dvi, data, uri + 1, page, pt);
 }
 
+static int engine_glyph_srcs(txp_engine *_self, fz_context *ctx, int page,
+                             const dvi_glyph_src **glyphs)
+{
+  SELF;
+  fz_buffer *data =
+    self->st.document.entry ? self->st.document.entry->saved.data : NULL;
+  *glyphs = NULL;
+  if (!data)
+    return 0;
+  return incdvi_glyph_srcs(ctx, self->dvi, data, page, glyphs);
+}
+
 static bool engine_step(txp_engine *_self, fz_context *ctx, bool restart_if_needed)
 {
   SELF;

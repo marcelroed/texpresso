@@ -7,6 +7,11 @@
 #include "xetex-synctex.h"
 #include "tectonic_bridge_core.h"
 
+/* TeXpresso: components of the ligature being shipped out as LIG_TRICK */
+static int32_t txp_lig_ptr = TEX_NULL;
+/* Position that the next glyph has without a "txp:" special */
+static uint64_t txp_next_src;
+
 
 #define DVI_BUF_SIZE 16384
 #define HALF_BUF 8192
@@ -77,6 +82,57 @@ dvi_out(eight_bits c)
 }
 
 
+/* TeXpresso: source position of the glyph of char node p (see txp_src).
+ * The frontend knows the position of each glyph from the previous one: it
+ * stands for the source characters that follow those of the previous glyph,
+ * one character unless the position says otherwise. Where this does not
+ * hold, a "txp:tag,line,column[,length]" special comes before the glyph
+ * ("txp:0" for no position). */
+static void
+txp_glyph_src(int32_t p)
+{
+    uint64_t s = txp_src[p] & ~TXP_SRC_INDIRECT;
+    int n = 1;
+
+    if (p == LIG_TRICK) {
+        /* The components of a ligature follow each other in the source,
+         * unless they come from a macro (all at the call site) */
+        int32_t first = txp_lig_ptr, last = TEX_NULL;
+        for (int32_t l = first; l != TEX_NULL; l = LLIST_link(l))
+            last = l;
+        s = first != TEX_NULL ? txp_src[first] & ~TXP_SRC_INDIRECT : 0;
+        uint64_t e = last != TEX_NULL ? TXP_SRC_POS(txp_src[last]) : 0;
+        if (s && (e >> 20) == (TXP_SRC_POS(s) >> 20) && e >= TXP_SRC_POS(s))
+            n = TXP_SRC_COL(e) - TXP_SRC_COL(s) + 1;
+    }
+
+    if (s & TXP_SRC_INSERTED) {
+        s &= ~TXP_SRC_INSERTED;
+        n = 0;
+    }
+
+    if (TXP_SRC_TAG(s) == 0)
+        s = 0;
+    if (s != txp_next_src || (s && n != 1)) {
+        char buf[64];
+        int len;
+        if (!s)
+            len = snprintf(buf, sizeof buf, "txp:0");
+        else if (n == 1)
+            len = snprintf(buf, sizeof buf, "txp:%d,%d,%d",
+                           TXP_SRC_TAG(s), TXP_SRC_LINE(s), TXP_SRC_COL(s));
+        else
+            len = snprintf(buf, sizeof buf, "txp:%d,%d,%d,%d",
+                           TXP_SRC_TAG(s), TXP_SRC_LINE(s), TXP_SRC_COL(s), n);
+        dvi_out(XXX1);
+        dvi_out(len);
+        for (int i = 0; i < len; i++)
+            dvi_out(buf[i]);
+    }
+    txp_next_src = s ? s + n : 0;
+}
+
+
 /*660: output the box `p` */
 void
 ship_out(int32_t p)
@@ -89,6 +145,7 @@ ship_out(int32_t p)
     const char *output_comment = "tectonic";
 
     synctex_sheet(INTPAR(mag));
+    txp_next_src = 0;
 
     if (job_name == 0)
         open_log_file();
@@ -635,6 +692,7 @@ hlist_out(void)
                 if (font_ec[f] >= c) {
                     if (font_bc[f] <= c) {
                         if (FONT_CHARACTER_INFO(f, c).s3 > 0) { /* if (char_exists(orig_char_info(f)(c))) */
+                            txp_glyph_src(p);
                             if (c >= 128)
                                 dvi_out(SET1);
                             dvi_out(c);
@@ -1003,6 +1061,7 @@ hlist_out(void)
             case LIGATURE_NODE:
                 /* 675: "Make node p look like a char_node and goto reswitch" */
                 mem[LIG_TRICK] = mem[p + 1]; /* = lig_char(p) */
+                txp_lig_ptr = LIGATURE_NODE_lig_ptr(p);
                 LLIST_link(LIG_TRICK) = LLIST_link(p);
                 p = LIG_TRICK;
                 xtx_ligature_present = true;

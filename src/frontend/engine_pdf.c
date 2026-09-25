@@ -88,6 +88,13 @@ static bool engine_resolve_link(txp_engine *_self, fz_context *ctx,
   return 1;
 }
 
+static int engine_glyph_srcs(txp_engine *_self, fz_context *ctx, int page,
+                             const dvi_glyph_src **glyphs)
+{
+  *glyphs = NULL;
+  return 0;
+}
+
 static bool engine_step(txp_engine *_self,
                         fz_context *ctx,
                         bool restart_if_needed)

@@ -349,6 +349,7 @@ typedef struct {
     int32_t limit; /* position of end of line in `buffer` */
     int32_t name; /* string number: name of current file or magic value for terminal, etc. */
     int32_t synctex_tag;
+    uint64_t txp_src; /* TeXpresso: source position of the call site of this level */
 } input_state_t;
 
 /* Functions originating in texmfmp.c */
@@ -453,6 +454,27 @@ extern int32_t temp_ptr;
 extern memory_word *mem;
 extern int32_t lo_mem_max;
 extern int32_t hi_mem_min;
+
+/* TeXpresso: source position of every mem word, for SyncTeX at the level of
+ * glyphs. A position packs the synctex tag, line and column of the document
+ * token that produced a node or token; 0 means unknown. Glyphs that do not
+ * stand for source characters (the hyphens of hyphenation) are flagged with
+ * TXP_SRC_INSERTED. Tokens of macros of another file (a package) that take
+ * the position of their call site are flagged with TXP_SRC_INDIRECT (see
+ * get_next). Shipping out writes the positions of glyphs as "txp:"
+ * specials (see txp_glyph_src in xetex-shipout.c). */
+extern uint64_t *txp_src;
+extern uint64_t txp_cur_src;      /* effective position of the last token read */
+extern uint64_t txp_prev_src;     /* txp_cur_src before it (see back_input) */
+extern uint64_t txp_src_override; /* when non-zero, used instead of txp_cur_src */
+#define TXP_SRC(tag, line, col) (((uint64_t)((tag) & 0x3FFFF) << 44) | ((uint64_t)((line) & 0xFFFFFF) << 20) | ((uint64_t)(col) & 0xFFFFF))
+#define TXP_SRC_INSERTED ((uint64_t)1 << 63)
+#define TXP_SRC_INDIRECT ((uint64_t)1 << 62)
+#define TXP_SRC_POS(s) ((s) & ~(TXP_SRC_INSERTED | TXP_SRC_INDIRECT))
+#define TXP_SRC_TAG(s) ((int32_t)(((s) >> 44) & 0x3FFFF))
+#define TXP_SRC_LINE(s) ((int32_t)(((s) >> 20) & 0xFFFFFF))
+#define TXP_SRC_COL(s) ((int32_t)((s) & 0xFFFFF))
+#define TXP_SRC_NOW() (txp_src_override ? txp_src_override : txp_cur_src)
 extern int32_t var_used, dyn_used;
 extern int32_t avail;
 extern int32_t mem_end;

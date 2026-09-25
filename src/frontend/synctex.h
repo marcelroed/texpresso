@@ -39,6 +39,9 @@ int synctex_page_count(synctex_t *stx);
 int synctex_input_count(synctex_t *stx);
 void synctex_page_offset(fz_context *ctx, synctex_t *stx, unsigned index, int *bop, int *eop);
 int synctex_input_offset(fz_context *ctx, synctex_t *stx, unsigned index);
+// Name of the input file with a tag (as in the records), pointing into buf;
+// returns its length, 0 if the tag is unknown.
+int synctex_input_name(synctex_t *stx, fz_buffer *buf, int tag, const char **name);
 // Backward search: the source of the material at (x, y) on a page. On
 // success, *name and *name_len are the input file name (pointing into buf),
 // *line is 1-based and *column the position of the engine's input reader

@@ -2437,6 +2437,387 @@ static void display_page(struct persistent_state *ps, ui_state *ui);
 
 static const char *relative_path(const char *path, const char *dir, int *go_up);
 
+/* Glyph sources. The engine writes the source position (input tag, line and
+   column, as in the SyncTeX records) of the glyphs of TeX fonts into the DVI
+   (txp: specials, see txp_glyph_src in xetex-shipout.c). They are exact:
+   characters of macros stand for the macro use, ligatures for all their
+   characters, the hyphens of hyphenation for none. Text in OpenType fonts
+   and pictures have no glyph source; there the text matching above
+   applies. */
+
+// Whether the input file with a tag is the file at path (relative to the
+// document). A few tags are remembered.
+struct sync_tags {
+  int tag[16];
+  bool is[16];
+  int count;
+};
+
+static bool sync_tag_is(struct persistent_state *ps, synctex_t *stx,
+                        fz_buffer *buf, struct sync_tags *tags, int tag,
+                        const char *path)
+{
+  for (int i = 0; i < tags->count; i++)
+    if (tags->tag[i] == tag)
+      return tags->is[i];
+  const char *name;
+  int len = synctex_input_name(stx, buf, tag, &name);
+  bool is = false;
+  if (len > 0 && len < 1024)
+  {
+    char full[1024];
+    memcpy(full, name, len);
+    full[len] = 0;
+    const char *rel = full;
+    int go_up = 0;
+    if (rel[0] == '/')
+      rel = relative_path(rel, ps->doc_path, &go_up);
+    while (rel[0] == '.' && rel[1] == '/')
+      rel += 2;
+    is = go_up == 0 && strcmp(rel, path) == 0;
+  }
+  if (tags->count < 16)
+  {
+    tags->tag[tags->count] = tag;
+    tags->is[tags->count] = is;
+    tags->count++;
+  }
+  return is;
+}
+
+// The end of the control word at a column of a line, or the column if there
+// is none
+static int sync_control_word_end(const int *line, int n, int column)
+{
+  if (column < 0 || column >= n || line[column] != '\\')
+    return column;
+  int i = column + 1;
+  while (i < n && sync_is_letter(line[i]))
+    i++;
+  return i == column + 1 && i < n ? i + 1 : i;
+}
+
+// Whether characters [from, to) of a line have one that prints (not
+// spaces, braces, math shifts, scripts, alignments, comments or the names
+// of macros): typeset text without a glyph source (in an OpenType font).
+static bool sync_prints_between(const int *line, int n, int from, int to)
+{
+  if (to > n)
+    to = n;
+  for (int i = 0; i < to;)
+  {
+    int c = line[i];
+    if (c == '%')
+      return false;
+    if (c == '\\')
+    {
+      if (i + 1 < n && sync_is_letter(line[i + 1]))
+      {
+        i++;
+        while (i < n && sync_is_letter(line[i]))
+          i++;
+        continue;
+      }
+      // Control symbols: \% \& \$ \_ \{ \} \# print their character
+      if (i + 1 < n && i + 1 >= from && line[i + 1] < 128 &&
+          strchr("%&$_{}#", line[i + 1]))
+        return true;
+      i += 2;
+      continue;
+    }
+    if (i >= from && !(c > 0 && c < 128 && strchr(" \t{}$^_&~", c)))
+      return true;
+    i++;
+  }
+  return false;
+}
+
+// A line of a file (1-based) decoded into `line`, returning its length
+// (0 if unknown)
+static int sync_source_line(struct persistent_state *ps, ui_state *ui,
+                            const char *path, int number, int *line)
+{
+  fz_buffer *data = sync_file_data(ps, ui, path);
+  const char *p = data ? sync_line_start(data, number) : NULL;
+  if (!p)
+    return 0;
+  const char *next;
+  return sync_decode_line(data, p, line, &next);
+}
+
+// The end of the arguments of the macro whose name starts at `column`:
+// the groups in brackets or braces right after its name.
+static int sync_macro_end(const int *line, int n, int column)
+{
+  int i = sync_control_word_end(line, n, column);
+  if (i < n && line[i] == '*')
+    i++;
+  while (i < n && (line[i] == '{' || line[i] == '['))
+  {
+    int close = line[i] == '{' ? '}' : ']', depth = 0;
+    for (; i < n; i++)
+    {
+      if (line[i] == '\\')
+        i++;
+      else if (line[i] == '{')
+        depth++;
+      else if (line[i] == '}')
+        depth--;
+      if (depth == 0 && line[i] == close)
+        break;
+    }
+    i++;
+  }
+  return i < n ? i : n;
+}
+
+// Whether the text before glyph g on its line in the displayed page has
+// glyph sources (or g starts the line). Text without glyph sources (in an
+// OpenType font, or typeset from another file, as by minted) can be what
+// the cursor is on, instead of what the glyph stands for.
+static bool sync_sourced_before(struct persistent_state *ps, ui_state *ui,
+                                dvi_glyph_src g)
+{
+  fz_point center = fz_make_point((g.box.x0 + g.box.x1) / 2,
+                                  (g.box.y0 + g.box.y1) / 2);
+  fz_rect cb;
+  if (!txp_renderer_char_before(ps->ctx, ui->doc_renderer, center, &cb))
+    return true;
+  fz_point c = fz_make_point((cb.x0 + cb.x1) / 2, (cb.y0 + cb.y1) / 2);
+  const dvi_glyph_src *gs;
+  int n = send(glyph_srcs, ui->eng, ps->ctx, ui->page, &gs);
+  for (int i = 0; i < n; i++)
+    if (fz_is_point_inside_rect(c, gs[i].box))
+      return true;
+  return false;
+}
+
+// Forward: the glyph at the editor cursor (ui->sync_target), looking on the
+// page SyncTeX found and the pages around it. The caret goes before the
+// first glyph of the column of the cursor, else after the last glyph of the
+// nearest column before it (inside a ligature, between its characters); a
+// cursor inside the name of a macro goes before the glyphs of the macro.
+// Returns whether a glyph was found, with its page and the caret on its
+// baseline. The caret is only a guess (*weak) when text without glyph
+// sources can be at the cursor.
+static bool sync_forward_by_glyphs(struct persistent_state *ps, ui_state *ui,
+                                   synctex_t *stx, fz_buffer *buf, int page,
+                                   int *out_page, fz_point *out, bool *weak)
+{
+  *weak = false;
+  const char *path = ui->sync_target.path;
+  int target = ui->sync_target.line, column = ui->sync_target.column;
+  if (!path[0] || target <= 0 || !stx || !buf)
+    return false;
+  if (column < 0)
+    column = 0;
+  struct sync_tags tags = {0};
+
+  // The glyphs of the nearest column at or before the cursor (the first and
+  // the last one), the first glyph of the nearest column after it, and the
+  // last glyph that ends at the cursor
+  dvi_glyph_src first = {0}, last = {0}, next = {0}, ending = {0};
+  int last_page = -1, next_page = -1, ending_page = -1;
+  int pages = send(page_count, ui->eng);
+  int order[3] = {page - 1, page, page + 1};
+  for (int k = 0; k < 3; k++)
+  {
+    int pg = order[k];
+    if (pg < 0 || pg >= pages)
+      continue;
+    const dvi_glyph_src *g;
+    int n = send(glyph_srcs, ui->eng, ps->ctx, pg, &g);
+    for (int i = 0; i < n; i++)
+    {
+      if (g[i].line != target ||
+          !sync_tag_is(ps, stx, buf, &tags, g[i].tag, path))
+        continue;
+      if (getenv("TXP_SYNC_DEBUG_GLYPHS"))
+        fprintf(stderr, "[synctex forward] glyph candidate: page %d #%d tag %d "
+                "column %d length %d at (%.2f, %.2f)-(%.2f, %.2f)\n", pg, i,
+                g[i].tag, g[i].column, g[i].length, g[i].origin.x,
+                g[i].origin.y, g[i].end.x, g[i].end.y);
+      int c = g[i].column;
+      if (g[i].length > 0 && c + g[i].length == column)
+      {
+        ending = g[i];
+        ending_page = pg;
+      }
+      if (c <= column)
+      {
+        if (last_page < 0 || c > last.column)
+        {
+          first = last = g[i];
+          last_page = pg;
+        }
+        else if (c == last.column)
+        {
+          // All glyphs of a macro have its column: the last one ends it.
+          // The first one that stands for characters (not a hyphen) starts
+          // it.
+          last = g[i];
+          last_page = pg;
+          if (first.length == 0 && g[i].length > 0)
+            first = g[i];
+        }
+      }
+      else if (next_page < 0 || c < next.column ||
+               (c == next.column && next.length == 0 && g[i].length > 0))
+      {
+        next = g[i];
+        next_page = pg;
+      }
+    }
+  }
+
+  // Text in between without glyph sources: leave it to text matching
+  static int line[SYNC_TEXT_MAX];
+  int n = sync_source_line(ps, ui, path, target, line);
+  if (last_page >= 0 &&
+      sync_prints_between(line, n, last.column + fz_maxi(last.length, 1), column))
+    last_page = -1;
+  if (next_page >= 0 && sync_prints_between(line, n, column, next.column))
+    next_page = -1;
+
+  fz_point pt;
+  dvi_glyph_src g;
+  int page_of_g;
+  if (last_page >= 0)
+  {
+    int c = last.column;
+    if (column == c && ending_page >= 0 && column < n && line[column] == '\\')
+      // Between text and a macro (a footnote mark): after the text
+      g = ending, pt = ending.end, last_page = ending_page;
+    else if (column == c)
+      g = first, pt = first.origin;
+    else if (column < sync_control_word_end(line, n, c))
+      // Inside the name of the macro: before its first glyph
+      g = first, pt = first.origin;
+    else if (column >= c + last.length)
+    {
+      g = last, pt = last.end;
+      // At text without glyph sources, or in the arguments of a macro (the
+      // text typeset from them has no glyph sources of its own)
+      if (sync_prints_between(line, n, column, column + 1) ||
+          (line[c] == '\\' && column < sync_macro_end(line, n, c)))
+        *weak = true;
+    }
+    else
+    {
+      // Inside a ligature
+      float t = (float)(column - c) / last.length;
+      g = last;
+      pt = fz_make_point(g.origin.x + t * (g.end.x - g.origin.x),
+                         g.origin.y + t * (g.end.y - g.origin.y));
+    }
+    page_of_g = last_page;
+    // The glyphs of a macro need not start what it typesets
+    if (column < sync_control_word_end(line, n, c) && line[c] == '\\' &&
+        pt.x == first.origin.x && pt.y == first.origin.y &&
+        last_page == ui->page && !sync_sourced_before(ps, ui, first))
+      *weak = true;
+  }
+  else if (next_page >= 0)
+  {
+    g = next;
+    pt = next.origin;
+    page_of_g = next_page;
+    // At text without glyph sources or a space (after what comes before)
+    if (sync_prints_between(line, n, column, column + 1) ||
+        (column < n && (line[column] == ' ' || line[column] == '\t')) ||
+        (next_page == ui->page && !sync_sourced_before(ps, ui, next)))
+      *weak = true;
+  }
+  else
+    return false;
+
+  if (getenv("TXP_SYNC_DEBUG"))
+    fprintf(stderr, "[synctex forward] glyph: page %d tag %d line %d column %d "
+            "length %d for column %d%s\n", page_of_g, g.tag, g.line,
+            g.column, g.length, column, *weak ? " (weak)" : "");
+  *out_page = page_of_g;
+  *out = pt;
+  return true;
+}
+
+// Backward: the source position of the glyph of the displayed page nearest
+// to pt (within a line of text vertically, 12pt horizontally), with the
+// number of its characters before pt in *after (a point on the second half
+// of a glyph is after it; a ligature splits evenly).
+#define SYNC_GLYPH_REACH_X 12
+
+static bool sync_backward_by_glyphs(struct persistent_state *ps, ui_state *ui,
+                                    fz_point pt, int *tag, int *line,
+                                    int *column, int *after)
+{
+  const dvi_glyph_src *g;
+  int n = send(glyph_srcs, ui->eng, ps->ctx, ui->page, &g);
+  int best = -1;
+  float best_d = INFINITY;
+  for (int i = 0; i < n; i++)
+  {
+    fz_rect b = g[i].box;
+    float dx = 0, dy = 0;
+    if (pt.x < b.x0)
+      dx = b.x0 - pt.x;
+    else if (pt.x > b.x1)
+      dx = pt.x - b.x1;
+    if (pt.y < b.y0)
+      dy = b.y0 - pt.y;
+    else if (pt.y > b.y1)
+      dy = pt.y - b.y1;
+    if (dy > 0 || dx > SYNC_GLYPH_REACH_X)
+      continue;
+    // Adjacent lines can overlap (with math): prefer the glyph whose
+    // baseline is nearest
+    float d = dx + fabsf(pt.y - g[i].origin.y) / 100;
+    if (d < best_d)
+    {
+      best_d = d;
+      best = i;
+    }
+  }
+  if (best < 0)
+    return false;
+
+  // The character of the text nearest to pt must be this glyph (its origin
+  // on the baseline of the glyph), not text without a glyph source next to
+  // it or above it
+  fz_rect cb, lb;
+  fz_point o;
+  if (txp_renderer_nearest_char(ps->ctx, ui->doc_renderer, pt, &cb, &lb, &o))
+  {
+    fz_point a = g[best].origin, b = g[best].end;
+    float ux = b.x - a.x, uy = b.y - a.y, len2 = ux * ux + uy * uy;
+    float t = len2 > 0 ? ((o.x - a.x) * ux + (o.y - a.y) * uy) / len2 : 0;
+    t = fz_clamp(t, 0, 1);
+    float dx = o.x - (a.x + t * ux), dy = o.y - (a.y + t * uy);
+    if (dx * dx + dy * dy > 1)
+      return false;
+    // Where the glyph ends, the next character starts (without a glyph
+    // source when it is text of an OpenType font)
+    if ((1 - t) * (1 - t) * len2 < 0.25f)
+      return false;
+  }
+
+  dvi_glyph_src gs = g[best];
+  *tag = gs.tag;
+  *line = gs.line;
+  *column = gs.column;
+  *after = 0;
+  if (gs.length > 0)
+  {
+    // Position along the baseline, in characters
+    float ux = gs.end.x - gs.origin.x, uy = gs.end.y - gs.origin.y;
+    float len2 = ux * ux + uy * uy;
+    float t = len2 > 0
+      ? ((pt.x - gs.origin.x) * ux + (pt.y - gs.origin.y) * uy) / len2
+      : 0;
+    *after = (int)(fz_clamp(t, 0, 1) * gs.length + 0.5f);
+  }
+  return true;
+}
+
 // Backward SyncTeX from a point of the displayed page, in document units
 static void sync_backward(struct persistent_state *ps, ui_state *ui, fz_point pt)
 {
@@ -2448,8 +2829,15 @@ static void sync_backward(struct persistent_state *ps, ui_state *ui, fz_point pt
   fprintf(stderr, "click: (%f,%f) mapped:(%f,%f)\n",
           pt.x, pt.y, f * pt.x, f * pt.y);
   const char *name;
-  int name_len, line, column;
-  if (!synctex_scan(ps->ctx, stx, buf, ui->page, f * pt.x, f * pt.y,
+  int name_len, line, column, tag, after;
+  bool by_glyph = sync_backward_by_glyphs(ps, ui, pt, &tag, &line, &column, &after);
+  if (by_glyph)
+  {
+    name_len = synctex_input_name(stx, buf, tag, &name);
+    by_glyph = name_len > 0;
+  }
+  if (!by_glyph &&
+      !synctex_scan(ps->ctx, stx, buf, ui->page, f * pt.x, f * pt.y,
                     &name, &name_len, &line, &column))
     return;
 
@@ -2462,7 +2850,32 @@ static void sync_backward(struct persistent_state *ps, ui_state *ui, fz_point pt
     rel = relative_path(rel, ps->doc_path, &go_up);
   while (rel[0] == '.' && rel[1] == '/')
     rel += 2;
-  if (go_up == 0)
+  if (by_glyph)
+  {
+    // A point after a glyph of a macro is still at the macro (its column is
+    // the start of its name)
+    static int src[SYNC_TEXT_MAX];
+    int n = go_up == 0 ? sync_source_line(ps, ui, rel, line, src) : 0;
+    if (getenv("TXP_SYNC_DEBUG"))
+      fprintf(stderr, "[synctex backward] glyph source: column %d%s\n",
+              column, after ? " (after)" : "");
+    if (!(column < n && src[column] == '\\'))
+      column += after;
+    else
+    {
+      // Text typeset by the macro from its arguments, when they show on
+      // the page: where the text is in them
+      int tl = line, tc = column;
+      if (sync_backward_by_text(ps, ui, pt, rel, &tl, &tc) && tl == line &&
+          tc >= sync_control_word_end(src, n, column) &&
+          tc <= sync_macro_end(src, n, column))
+        column = tc;
+    }
+    if (getenv("TXP_SYNC_DEBUG"))
+      fprintf(stderr, "[synctex backward] glyph: tag %d line %d column %d\n",
+              tag, line, column);
+  }
+  else if (go_up == 0)
     sync_backward_by_text(ps, ui, pt, rel, &line, &column);
 
   // The editor gets a 1-based column, 0 if unknown.
@@ -3900,7 +4313,48 @@ bool texpresso_main(struct persistent_state *ps)
         bool no_caret = false;
 
         int precision = synctex_candidate_imprecise(stx);
-        if (page == ui->page)
+        int glyph_page;
+        fz_point gp;
+        bool weak;
+        bool by_glyph = sync_forward_by_glyphs(ps, ui, stx, buf, page,
+                                               &glyph_page, &gp, &weak);
+        fz_point tp;
+        fz_rect tl;
+        int max_len;
+        if (by_glyph && weak && ui->page != glyph_page)
+        {
+          ui->page = glyph_page;
+          display_page(ps, ui);
+        }
+        if (by_glyph && weak &&
+            sync_refine_by_text(ps, ui, gp, fz_empty_rect, false, true, 0,
+                                &max_len, &tp, &tl))
+        {
+          // Text matching around a guess from the glyphs
+          fprintf(stderr, "[synctex forward] refined by text: (%.02f, %.02f)\n",
+                  tp.x, tp.y);
+          page = glyph_page;
+          p = tp;
+          mark_box = tl;
+          precision = 0;
+        }
+        else if (by_glyph)
+        {
+          page = glyph_page;
+          if (ui->page != page)
+          {
+            ui->page = page;
+            display_page(ps, ui);
+          }
+          p = gp;
+          // The line of text holding the glyph
+          fz_rect cb;
+          if (!txp_renderer_nearest_char(ps->ctx, ui->doc_renderer, p, &cb, &mark_box, NULL) ||
+              !(mark_box.y0 - 2 <= p.y && p.y <= mark_box.y1 + 2))
+            mark_box = fz_empty_rect;
+          precision = 0;
+        }
+        else if (page == ui->page)
         {
           bool floating = precision & SYNCTEX_FLOATING;
           // Only trust matches inside the picture when the target line

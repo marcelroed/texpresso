@@ -344,6 +344,20 @@ def expand_chars(raw, line_box):
                                         ox + k * w, oy, line_box))
         else:
             out.append(RenderedChar(chr(c), x0, y0, x1, y1, ox, oy, line_box))
+    # MuPDF decomposes ligatures into their first character with the whole
+    # glyph and the others with no width at its end: split the glyph evenly.
+    i = 0
+    while i < len(out):
+        j = i + 1
+        while (j < len(out) and out[j].x0 == out[j].x1 == out[i].x1 and
+               out[i].x1 > out[i].x0 and out[j].c.isalpha()):
+            j += 1
+        if j > i + 1:
+            x0, w = out[i].x0, (out[i].x1 - out[i].x0) / (j - i)
+            for k in range(i, j):
+                out[k].x0, out[k].x1 = x0 + (k - i) * w, x0 + (k - i + 1) * w
+                out[k].ox = out[i].ox + (k - i) * w
+        i = j
     return out
 
 

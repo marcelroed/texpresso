@@ -143,6 +143,28 @@ static dvi_fontdef *dvi_current_font(fz_context *ctx, dvi_state *st)
   return dvi_fonttable_get(ctx, st->fonts, st->f);
 }
 
+// Record the source position of character c of a TeX font, at the current
+// position. Its box spans at least the height of a line of text (from
+// -0.25 to 0.75 em), for pointing at it.
+static void glyph_src(fz_context *ctx, dvi_context *dc, dvi_state *st,
+                      dvi_font *font, uint32_t c, fixed_t scale_factor)
+{
+  float em = scale_factor.value;
+  float w = 0, h = 0.75f * em, d = 0.25f * em;
+  if (font && font->tfm && c <= 255)
+  {
+    w = fixed_mul(tex_tfm_char_width(font->tfm, c), scale_factor).value;
+    h = fz_max(h, fixed_mul(tex_tfm_char_height(font->tfm, c), scale_factor).value);
+    d = fz_max(d, fixed_mul(tex_tfm_char_depth(font->tfm, c), scale_factor).value);
+  }
+  float s = dc->scale;
+  fz_matrix m = dvi_get_ctm(dc, st);
+  dvi_srcmap_add(ctx, dc->srcmap,
+                 fz_transform_point_xy(0, 0, m),
+                 fz_transform_point_xy(w * s, 0, m),
+                 fz_transform_rect(fz_make_rect(0, -d * s, w * s, h * s), m));
+}
+
 void dvi_exec_char(fz_context *ctx, dvi_context *dc, dvi_state *st, uint32_t c, bool set)
 {
   int debug = 0;
@@ -158,6 +180,9 @@ void dvi_exec_char(fz_context *ctx, dvi_context *dc, dvi_state *st, uint32_t c, 
 
   dvi_font *font = def->tex_font.font;
   fixed_t scale_factor = def->tex_font.spec.scale_factor;
+  // Glyphs of the page, not the characters of virtual fonts
+  if (dc->srcmap && st == &dc->root)
+    glyph_src(ctx, dc, st, font, c, scale_factor);
   if (def && font)
   {
     if (!font->fz && !font->vf)
