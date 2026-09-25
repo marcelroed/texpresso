@@ -27,6 +27,7 @@
 
 #include <mupdf/fitz/context.h>
 #include <mupdf/fitz/buffer.h>
+#include <stdbool.h>
 
 typedef struct synctex_s synctex_t;
 
@@ -38,7 +39,13 @@ int synctex_page_count(synctex_t *stx);
 int synctex_input_count(synctex_t *stx);
 void synctex_page_offset(fz_context *ctx, synctex_t *stx, unsigned index, int *bop, int *eop);
 int synctex_input_offset(fz_context *ctx, synctex_t *stx, unsigned index);
-void synctex_scan(fz_context *ctx, synctex_t *stx, fz_buffer *buf, const char *doc_dir, unsigned page, int x, int y);
+// Backward search: the source of the material at (x, y) on a page. On
+// success, *name and *name_len are the input file name (pointing into buf),
+// *line is 1-based and *column the position of the engine's input reader
+// when the material was read (0-based, in characters, -1 if unknown).
+bool synctex_scan(fz_context *ctx, synctex_t *stx, fz_buffer *buf,
+                  unsigned page, int x, int y,
+                  const char **name, int *name_len, int *line, int *column);
 
 int synctex_has_target(synctex_t *stx);
 // column is 0-based (characters before the cursor), or -1 if unknown.

@@ -750,16 +750,19 @@ static int get_input(fz_buffer *buf,
   return (fend - filename);
 }
 
-void synctex_scan(fz_context *ctx,
+bool synctex_scan(fz_context *ctx,
                   synctex_t *stx,
                   fz_buffer *buf,
-                  const char *doc_dir,
                   unsigned page,
                   int x,
-                  int y)
+                  int y,
+                  const char **name,
+                  int *name_len,
+                  int *line,
+                  int *column)
 {
   if (synctex_page_count(stx) <= page)
-    return;
+    return 0;
 
   int bop, eop;
   synctex_page_offset(ctx, stx, page, &bop, &eop);
@@ -770,18 +773,18 @@ void synctex_scan(fz_context *ctx,
   c.area = INFINITY;
 
   parse_tree(stx, buf, ptr, x, y, &c);
-  if (c.link.tag)
-  {
-    const char *fname;
-    int len = get_input(buf, stx, c.link.tag-1, &fname);
-    fprintf(stderr,
-            "synctex best candidate: (%d,%d)-(%d,%d) "
-            "file:%.*s line:%d column:%d\n",
-            c.rect.x0, c.rect.y0, c.rect.x1, c.rect.y1,
-            len, fname,
-            c.link.line, c.link.column);
-    editor_synctex(doc_dir, fname, len, c.link.line, c.link.column);
-  }
+  if (!c.link.tag)
+    return 0;
+
+  *name_len = get_input(buf, stx, c.link.tag-1, name);
+  *line = c.link.line;
+  *column = c.link.column;
+  fprintf(stderr,
+          "synctex best candidate: (%d,%d)-(%d,%d) "
+          "file:%.*s line:%d column:%d\n",
+          c.rect.x0, c.rect.y0, c.rect.x1, c.rect.y1,
+          *name_len, *name, c.link.line, c.link.column);
+  return 1;
 }
 
 void synctex_set_target(synctex_t *stx, int current_page, const char *path, int line, int column)
@@ -1275,7 +1278,13 @@ int synctex_find_target(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int *pa
   }
 
   if (synctex_input_closed(ctx, stx, stx->input_tag))
+  {
+    // The target file is fully typeset: the search is over. Tell tests that
+    // wait for an answer when there is none.
+    if (stx->candidate_page == -1)
+      fprintf(stderr, "[synctex forward] no match\n");
     synctex_clear_search(stx);
+  }
 
   return updated_candidate;
 }

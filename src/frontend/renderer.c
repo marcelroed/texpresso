@@ -25,6 +25,7 @@
 #include "renderer.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 
 static float clampf(float x, float min, float max)
@@ -1011,6 +1012,9 @@ int txp_fold_char(int c)
       return c;
     return 0;
   }
+  if (c < 0xC0)
+    // Control characters, Latin-1 punctuation and symbols
+    return 0;
   static const char latin1[] =
     "aaaaaaaceeeeiiii" "dnooooo\0ouuuuyts" // U+00C0 .. U+00DF
     "aaaaaaaceeeeiiii" "dnooooo\0ouuuuyty"; // U+00E0 .. U+00FF
@@ -1024,18 +1028,21 @@ int txp_fold_char(int c)
 
 struct text_char {
   int c;
+  // First of a line, after a space or punctuation, or raised or lowered
+  // (the mark of a footnote)
+  bool word_start;
   fz_point origin;
   fz_rect char_box, line_box;
 };
 
-bool txp_renderer_find_text(fz_context *ctx, txp_renderer *self,
-                            const int *needle, int len, int offset,
-                            fz_point anchor, fz_rect region,
-                            fz_point *out, fz_rect *out_line)
+// The folded characters of the displayed page in reading order (characters
+// that fold to 0 are left out). The caller frees the array.
+static struct text_char *page_text(fz_context *ctx, txp_renderer *self, int *count)
 {
+  *count = 0;
   fz_stext_page *page = get_stext(ctx, self);
-  if (!page || len <= 0)
-    return 0;
+  if (!page)
+    return NULL;
 
   int n = 0, cap = 0;
   struct text_char *text = NULL;
@@ -1044,55 +1051,270 @@ bool txp_renderer_find_text(fz_context *ctx, txp_renderer *self,
     if (b->type != FZ_STEXT_BLOCK_TEXT)
       continue;
     for (fz_stext_line *l = b->u.t.first_line; l; l = l->next)
-      for (fz_stext_char *ch = l->first_char; ch; ch = ch->next)
+    {
+      bool word_start = true;
+      fz_stext_char *prev = NULL;
+      for (fz_stext_char *ch = l->first_char; ch; prev = ch, ch = ch->next)
       {
         int c = txp_fold_char(ch->c);
         if (!c)
+        {
+          word_start = true;
           continue;
+        }
+        if (prev && (fabsf(ch->origin.y - prev->origin.y) > 0.5f ||
+                     fabsf(ch->size - prev->size) > 0.5f))
+          word_start = true;
         if (n == cap)
         {
           cap = cap ? cap * 2 : 1024;
           text = fz_realloc(ctx, text, cap * sizeof(*text));
         }
         text[n].c = c;
+        text[n].word_start = word_start;
         text[n].origin = ch->origin;
         text[n].char_box = fz_rect_from_quad(ch->quad);
         text[n].line_box = l->bbox;
         n++;
+        word_start = false;
       }
+    }
   }
+  *count = n;
+  return text;
+}
 
-  // Rank of a match: inside the region first, then after the anchor in
-  // reading order (the first such match), then before it (the last one).
-  int best = -1, best_rank = 0;
-  bool has_region = !fz_is_empty_rect(region);
+// Distance from a point to a character box, weighting the vertical
+// distance: a character of the line under the point comes first. Boxes of
+// adjacent lines can overlap (the boxes of text lines with math always do),
+// ties go to the character whose box is vertically centered on the point.
+static float text_char_distance(const struct text_char *t, fz_point p)
+{
+  float dy = 0, dx = 0;
+  if (p.y < t->char_box.y0)
+    dy = t->char_box.y0 - p.y;
+  else if (p.y > t->char_box.y1)
+    dy = p.y - t->char_box.y1;
+  if (p.x < t->char_box.x0)
+    dx = t->char_box.x0 - p.x;
+  else if (p.x > t->char_box.x1)
+    dx = p.x - t->char_box.x1;
+  float center = (t->char_box.y0 + t->char_box.y1) / 2;
+  return dy * 100 + dx + fabsf(p.y - center) / 100;
+}
+
+// Whether needle[j...] matches text[i...] up to the next gap, over at most
+// TXP_TEXT_LOOKAHEAD characters.
+static bool match_ahead(const struct text_char *text, int n, int i,
+                        const int *needle, const unsigned char *gap, int len,
+                        int j)
+{
+  for (int m = 0; m < TXP_TEXT_LOOKAHEAD && j + m < len && (m == 0 || !gap[j + m]); m++)
+    if (i + m >= n || text[i + m].c != needle[j + m])
+      return false;
+  return true;
+}
+
+struct text_match {
+  int start;    // index in the text of needle[0]
+  int at;       // index in the text of needle[offset]
+  int end;      // index in the text of the last character of the needle
+  int skipped;  // characters of the text skipped at gaps
+};
+
+// Match the needle at text[i], skipping at most gap[j] characters of the
+// text before needle[j] (the fewest after which the needle goes on
+// matching). What a macro typesets starts a word: the text skipped cannot
+// start in the middle of one (as "heading" matching the beginning of
+// "headings").
+static bool match_at(const struct text_char *text, int n, int i,
+                     const int *needle, const unsigned char *gap, int len,
+                     int offset, struct text_match *m)
+{
+  m->start = i;
+  m->at = -1;
+  m->skipped = 0;
+  for (int j = 0; j < len; j++, i++)
+  {
+    if (j > 0 && gap && gap[j])
+    {
+      int k = 0, max_gap = i < n && text[i].word_start ? gap[j] : 0;
+      while (k <= max_gap &&
+             !match_ahead(text, n, i + k, needle, gap, len, j))
+        k++;
+      if (k > max_gap)
+        return false;
+      i += k;
+      m->skipped += k;
+    }
+    else if (i >= n || text[i].c != needle[j])
+      return false;
+    if (j == offset)
+      m->at = i;
+  }
+  m->end = i - 1;
+  return true;
+}
+
+bool txp_renderer_find_text(fz_context *ctx, txp_renderer *self,
+                            const int *needle, const unsigned char *gap,
+                            int len, int offset, bool after, fz_point anchor,
+                            fz_rect region, int max_distance,
+                            fz_point *out, fz_rect *out_line)
+{
+  if (len <= 0)
+    return 0;
+  int n;
+  struct text_char *text = page_text(ctx, self, &n);
+  if (!text)
+    return 0;
+
+  // Matches ending on the same character are one occurrence of the needle
+  // (with gaps, the start of the needle can match earlier): keep the one
+  // skipping the fewest characters.
+  struct text_match *found = NULL;
+  int nfound = 0;
   for (int i = 0; i + len <= n; i++)
   {
-    int j = 0;
-    while (j < len && text[i + j].c == needle[j])
-      j++;
-    if (j < len)
+    struct text_match m;
+    if (!match_at(text, n, i, needle, gap, len, offset, &m))
       continue;
-    fz_point p = text[i].origin;
-    bool inside = has_region && fz_is_point_inside_rect(p, fz_expand_rect(region, 2));
-    bool after = p.y > anchor.y + 2 || (fabsf(p.y - anchor.y) <= 2 && p.x >= anchor.x - 1);
-    int rank = (inside ? 0 : 2) + (after ? 0 : 1);
+    if (nfound > 0 && found[nfound - 1].end == m.end)
+    {
+      if (m.skipped < found[nfound - 1].skipped)
+        found[nfound - 1] = m;
+      continue;
+    }
+    if ((nfound & (nfound - 1)) == 0)
+      found = fz_realloc(ctx, found, (nfound ? 2 * nfound : 1) * sizeof(*found));
+    found[nfound++] = m;
+  }
+
+  // With max_distance >= 0, the match nearest to the anchor in reading
+  // order, counted in characters from the one closest to the anchor.
+  int anchor_index = -1;
+  if (max_distance >= 0)
+  {
+    float d = INFINITY;
+    for (int i = 0; i < n; i++)
+    {
+      float di = text_char_distance(&text[i], anchor);
+      if (di < d)
+      {
+        d = di;
+        anchor_index = i;
+      }
+    }
+  }
+
+  // Otherwise, rank matches inside the region first, then after the anchor
+  // in reading order (the first such match), then before it (the last one).
+  int best = -1, best_rank = 0, matches = nfound;
+  bool has_region = !fz_is_empty_rect(region);
+  for (int f = 0; f < nfound; f++)
+  {
+    int at = found[f].at;
+    int rank;
+    if (anchor_index >= 0)
+    {
+      rank = abs(at - anchor_index);
+      if (best == -1 || rank < best_rank)
+      {
+        best = at;
+        best_rank = rank;
+      }
+      continue;
+    }
+    fz_point p = text[found[f].start].origin;
+    // The character at the cursor, not the start of the needle: the words
+    // before it can be on the line above the region.
+    bool inside = has_region &&
+                  fz_is_point_inside_rect(text[at].origin, fz_expand_rect(region, 2));
+    bool is_after = p.y > anchor.y + 2 || (fabsf(p.y - anchor.y) <= 2 && p.x >= anchor.x - 1);
+    rank = (inside ? 0 : 2) + (is_after ? 0 : 1);
     if (best == -1 || rank < best_rank || (rank == best_rank && (rank & 1)))
     {
-      best = i;
+      best = at;
       best_rank = rank;
     }
   }
 
+  // A match farther from the anchor only when it is long and unique on the
+  // page (the text of a footnote is far from its mark, and so is the anchor).
+  if (anchor_index >= 0 && best >= 0 && best_rank > max_distance &&
+      !(matches == 1 && len >= 10))
+    best = -1;
+
+  fz_free(ctx, found);
   if (best >= 0)
   {
-    if (offset < len)
-      *out = fz_make_point(text[best + offset].char_box.x0, text[best + offset].origin.y);
-    else
-      *out = fz_make_point(text[best + len - 1].char_box.x1, text[best + len - 1].origin.y);
-    int k = offset < len ? offset : len - 1;
-    *out_line = text[best + k].line_box;
+    const struct text_char *t = &text[best];
+    *out = fz_make_point(after ? t->char_box.x1 : t->char_box.x0, t->origin.y);
+    *out_line = t->line_box;
   }
   fz_free(ctx, text);
   return best >= 0;
+}
+
+int txp_renderer_text_at(fz_context *ctx, txp_renderer *self, fz_point pt,
+                         int radius, int *out, int *index, bool *after)
+{
+  int n;
+  struct text_char *text = page_text(ctx, self, &n);
+  if (!text)
+    return 0;
+
+  int k = -1;
+  float d = INFINITY;
+  for (int i = 0; i < n; i++)
+  {
+    float di = text_char_distance(&text[i], pt);
+    if (di < d)
+    {
+      d = di;
+      k = i;
+    }
+  }
+
+  int count = 0;
+  // Only a point on a text line, or in the gap next to one (see
+  // text_char_distance for the unit).
+  if (k >= 0 && d < 100 * 4)
+  {
+    int first = k > radius ? k - radius : 0;
+    int last = k + radius < n - 1 ? k + radius : n - 1;
+    for (int i = first; i <= last; i++)
+      out[count++] = text[i].c;
+    *index = k - first;
+    *after = pt.x > (text[k].char_box.x0 + text[k].char_box.x1) / 2;
+  }
+  fz_free(ctx, text);
+  return count;
+}
+
+void txp_renderer_dump_text(fz_context *ctx, txp_renderer *self, FILE *f)
+{
+  fz_stext_page *page = get_stext(ctx, self);
+  fprintf(f, "[");
+  bool first_line = true;
+  for (fz_stext_block *b = page ? page->first_block : NULL; b; b = b->next)
+  {
+    if (b->type != FZ_STEXT_BLOCK_TEXT)
+      continue;
+    for (fz_stext_line *l = b->u.t.first_line; l; l = l->next)
+    {
+      fprintf(f, "%s\n{\"bbox\": [%.2f, %.2f, %.2f, %.2f], \"chars\": [",
+              first_line ? "" : ",", l->bbox.x0, l->bbox.y0, l->bbox.x1, l->bbox.y1);
+      first_line = false;
+      for (fz_stext_char *ch = l->first_char; ch; ch = ch->next)
+      {
+        fz_rect r = fz_rect_from_quad(ch->quad);
+        fprintf(f, "%s[%d, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f]",
+                ch == l->first_char ? "" : ", ", ch->c,
+                r.x0, r.y0, r.x1, r.y1, ch->origin.x, ch->origin.y);
+      }
+      fprintf(f, "]}");
+    }
+  }
+  fprintf(f, "\n]\n");
 }

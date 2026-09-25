@@ -92,15 +92,39 @@ fz_point txp_renderer_document_to_screen(fz_context *ctx, txp_renderer *self, fz
 // does not take part (punctuation, spaces).
 int txp_fold_char(int c);
 
+#define TXP_TEXT_MAX_GAP 64
+#define TXP_TEXT_LOOKAHEAD 5
+
 // Find `needle` (folded characters, see txp_fold_char) in the text of the
-// displayed page, ignoring non-matching characters. Among the matches,
-// prefer one inside `region` (when not empty), then the first one after
-// `anchor` in reading order. On success, *out is the left edge of the
-// character at `offset` on its baseline (the end of the match if offset ==
-// len) and *out_line the bounding box of its text line.
+// displayed page, ignoring characters that do not take part. Where gap[j]
+// > 0 (gap can be NULL), up to gap[j] (at most TXP_TEXT_MAX_GAP) characters
+// of the page that are not in the needle can come before needle[j], from
+// the start of a word: the fewest after which the next TXP_TEXT_LOOKAHEAD
+// characters of the needle (up to its next gap) match. With max_distance >= 0,
+// take the match nearest to `anchor` in reading order, if its character at
+// `offset` is at most max_distance characters from the one closest to the
+// anchor (or if it is the only match, and the needle is long). Otherwise,
+// prefer a match inside `region` (when not empty), then
+// the first one after `anchor` in reading order. On success, *out is the
+// left edge of the character at `offset` on its baseline (its right edge if
+// `after`), and *out_line the bounding box of its text line.
 bool txp_renderer_find_text(fz_context *ctx, txp_renderer *self,
-                            const int *needle, int len, int offset,
-                            fz_point anchor, fz_rect region,
+                            const int *needle, const unsigned char *gap, int len,
+                            int offset, bool after, fz_point anchor,
+                            fz_rect region, int max_distance,
                             fz_point *out, fz_rect *out_line);
+
+// The folded characters of the displayed page around `pt`, in reading
+// order: up to `radius` characters on each side of the one nearest to pt.
+// Returns how many were stored in `out` (at most 2 * radius + 1), 0 if pt
+// is not on or next to a text line. *index is the character at pt, and
+// *after is set when pt is past its middle.
+int txp_renderer_text_at(fz_context *ctx, txp_renderer *self, fz_point pt,
+                         int radius, int *out, int *index, bool *after);
+
+// Testing: write the text of the current contents as JSON, one entry per
+// text line with the code point, box and origin of each character, in
+// document units.
+void txp_renderer_dump_text(fz_context *ctx, txp_renderer *self, FILE *f);
 
 #endif /*!_RENDERER_H_*/

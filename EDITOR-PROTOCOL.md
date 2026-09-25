@@ -169,6 +169,13 @@ Try to scroll the UI to the contents defined in TeX file at "path" and line. The
 
 The optional `column` (0-based, the number of characters before the cursor on that line) refines the position within the line: TeXpresso's engine records the position of the input reader in every SyncTeX record, so the viewer can point at the word under the cursor rather than at the first material of the line. The viewer briefly highlights the resulting position.
 
+```scheme
+(test-click page x y)
+(test-page-text page "path")
+```
+
+For tests (see [test/synctex-check.py](test/synctex-check.py)). `test-click` displays `page` (0-based) and runs backward synchronisation at `(x, y)` in document units (points from the top left corner of the page), as a click there would; the `synctex` message, if any, is followed by the line `[test] click done` on stderr. `test-page-text` writes the text of `page` to the file at "path", as a JSON array of lines `{"bbox": [x0, y0, x1, y1], "chars": [[code, x0, y0, x1, y1, origin_x, origin_y], ...]}`, then prints `[test] page text written` on stderr. Both print `[test] page N is not available` instead when the page does not exist.
+
 ## Messages (texpresso -> editor)
 
 ### Byte-based synchronization of output messages and log file
@@ -215,10 +222,23 @@ For instance, to avoid flickering, an editor can keep stale lines after receivin
 ### SyncTeX
 
 ```
-(synctex "path" line)
+(synctex "path" line column)
 ```
 
-SyncTeX backward synchronisation: the user clicked on text produced by LaTeX sources at path:line. The action is usually to open this file in the editor and jumps to this line.
+SyncTeX backward synchronisation: the user clicked on text produced by LaTeX sources at path:line. The action is usually to open this file in the editor and jumps to this line. `column` is 1-based, the character right after the position clicked (the cursor goes before it), or 0 if unknown.
+
+### Tracing synchronisation
+
+TeXpresso traces synchronisation on stderr. Forward, each `synctex-forward` request ends with exactly one of
+
+```
+[synctex forward] mark: page P at (x, y) line (x0, y0)-(x1, y1) caret C precision N
+[synctex forward] no match
+```
+
+preceded by `[synctex forward] sync: hit page ...` (the SyncTeX record found) and `[synctex forward] refined by text: (x, y)` when the text around the cursor was found on the page. `precision` is 0 when SyncTeX found the line and column, otherwise a combination of 1 (imprecise: no column), 2 (inside a float or picture) and 4 (another line). Backward, `[synctex backward] refined by text: line L column C (N characters match)` gives the position found by aligning the source around the SyncTeX line with the text around the click. With the environment variable `TXP_SYNC_DEBUG` set, TeXpresso also prints the needles tried forward and the text aligned backward.
+
+`test/synctex-check.py document.tex` measures both directions on a whole document with these traces and the test commands above: see its header for the method. For instance `test/synctex-check.py -I build --show 20 paper.tex` prints the success rates by context (text, footnotes, captions, TikZ nodes, ...) and the first 20 failures of each direction; `--json` saves every case. The cases are split between `--jobs` headless viewers (8 by default, at most the number of CPUs).
 
 ### VFS reset
 

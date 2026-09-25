@@ -37,6 +37,8 @@ enum EDITOR_COMMAND
   EDIT_RESUME,
   EDIT_RERUN,
   EDIT_RERUN_ONCE,
+  EDIT_TEST_CLICK,
+  EDIT_TEST_PAGE_TEXT,
 };
 
 struct editor_change
@@ -137,6 +139,18 @@ struct editor_command
 
     struct {
     } rerun_once;
+
+    // Testing: backward sync at a position of a page, in document units
+    struct {
+      int page;
+      float x, y;
+    } test_click;
+
+    // Testing: write the text of a page with character boxes to a file
+    struct {
+      int page;
+      const char *path;
+    } test_page_text;
   };
 };
 

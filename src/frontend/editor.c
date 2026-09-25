@@ -278,6 +278,36 @@ bool editor_parse(fz_context *ctx,
             },
     };
   }
+  else if (strcmp(verb, "test-click") == 0)
+  {
+    if (len != 4)
+      goto arity;
+    val page = val_array_get(ctx, stack, command, 1);
+    val x = val_array_get(ctx, stack, command, 2);
+    val y = val_array_get(ctx, stack, command, 3);
+    if (!val_is_number(page) || !val_is_number(x) || !val_is_number(y))
+      goto arguments;
+    *out = (struct editor_command){
+        .tag = EDIT_TEST_CLICK,
+        .test_click = {.page = val_number(ctx, page),
+                       .x = val_number(ctx, x),
+                       .y = val_number(ctx, y)},
+    };
+  }
+  else if (strcmp(verb, "test-page-text") == 0)
+  {
+    if (len != 3)
+      goto arity;
+    val page = val_array_get(ctx, stack, command, 1);
+    val path = val_array_get(ctx, stack, command, 2);
+    if (!val_is_number(page) || !val_is_string(path))
+      goto arguments;
+    *out = (struct editor_command){
+        .tag = EDIT_TEST_PAGE_TEXT,
+        .test_page_text = {.page = val_number(ctx, page),
+                           .path = val_string(ctx, stack, path)},
+    };
+  }
   else if (strcmp(verb, "crop") == 0)
   {
     if (len != 1)

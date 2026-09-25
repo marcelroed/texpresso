@@ -227,28 +227,221 @@ static void render_sync_mark(fz_context *ctx, ui_state *ui)
   SDL_RenderFillRectF(ui->sdl_renderer, &caret);
 }
 
-/* Forward sync refinement by text.
+/* SyncTeX refinement by text.
 
-   SyncTeX locates some material only coarsely: a caption or the body of an
-   align environment is read as a macro argument and typeset at its last
-   line, so all of it carries that line and one column, and the records of a
-   TikZ picture are not where its content is drawn. In those cases, look for
-   the words around the editor cursor in the text of the page. */
+   SyncTeX locates material only coarsely: records mark where a run of
+   characters starts, a caption or the body of an align environment is read
+   as a macro argument and typeset at its last line, the first word of a
+   typeset line only belongs to the box of the line, which carries the line
+   where the paragraph ended, and the records of a TikZ picture are not where
+   its content is drawn. Both directions therefore match the text of the
+   source against the text of the page around the position SyncTeX found. */
 
-#define SYNC_TEXT_MAX 512
+#define SYNC_TEXT_MAX 4096
 
 struct sync_word {
   int start, end;          // characters of the line, [start, end)
   int first, count;        // folded characters, in sync_text.chars
+  // Text typeset away from the running text (footnotes, floats, the nodes
+  // of a TikZ picture) is a segment of its own, 0 is the running text.
+  int segment;
+};
+
+#define SYNC_SEGMENT_DEPTH 16
+
+enum sync_segment_kind {
+  SYNC_SEGMENT_ARGUMENT,   // \footnote{...}: until the group closes
+  SYNC_SEGMENT_FLOAT,      // \begin{figure}: until \end of a float
+  SYNC_SEGMENT_NODE,       // node {...} in a TikZ picture
 };
 
 struct sync_text {
   int chars[SYNC_TEXT_MAX];     // folded characters of all words
   int source[SYNC_TEXT_MAX];    // their index in the line
+  // Whether material left out (math, macros and their arguments) comes
+  // right before the character: the page can have more text there, up to
+  // this many characters (0 if none).
+  unsigned char gap[SYNC_TEXT_MAX];
   int nchars;
   struct sync_word words[SYNC_TEXT_MAX];
   int nwords;
+  // Across lines: brace depth, the open segments with the depth of their
+  // group, TikZ pictures (only the text of their nodes is typeset as is)
+  // and whether a node is waiting for its text.
+  int depth, nsegments, open, tikz;
+  bool node;
+  int segment[SYNC_SEGMENT_DEPTH], segment_depth[SYNC_SEGMENT_DEPTH];
+  enum sync_segment_kind segment_kind[SYNC_SEGMENT_DEPTH];
+  // The verbatim environment the lines are in, if any, and whether its
+  // text is typeset at all (not for comment)
+  char verbatim[32];
+  bool hidden;
 };
+
+static void sync_text_reset(struct sync_text *t)
+{
+  t->nchars = t->nwords = 0;
+  t->depth = t->nsegments = t->open = t->tikz = 0;
+  t->node = false;
+  t->verbatim[0] = 0;
+}
+
+// Append the folded character f, line[i], to the word being read (if
+// *in_word) or to a new one.
+static void sync_add_char(struct sync_text *t, bool *in_word, int i, int f,
+                          int gap)
+{
+  if (t->nchars == SYNC_TEXT_MAX || (!*in_word && t->nwords == SYNC_TEXT_MAX))
+    return;
+  if (!*in_word)
+  {
+    struct sync_word *w = &t->words[t->nwords++];
+    w->start = i;
+    w->first = t->nchars;
+    w->count = 0;
+    w->segment = t->nsegments ? t->segment[t->nsegments - 1] : 0;
+    *in_word = true;
+  }
+  struct sync_word *w = &t->words[t->nwords - 1];
+  t->chars[t->nchars] = f;
+  t->source[t->nchars] = i;
+  t->gap[t->nchars] = gap;
+  t->nchars++;
+  w->count++;
+  w->end = i + 1;
+}
+
+// Whether line[i] starts the string s.
+static bool sync_looking_at(const int *line, int n, int i, const char *s)
+{
+  for (; *s; s++, i++)
+    if (i >= n || line[i] != *s)
+      return false;
+  return true;
+}
+
+// Environments whose text is typeset as it is.
+static bool sync_is_verbatim(const char *env)
+{
+  static const char *names[] = {
+    "verbatim", "verbatim*", "Verbatim", "Verbatim*", "BVerbatim", "LVerbatim",
+    "lstlisting", "minted", "comment", NULL
+  };
+  for (const char **n = names; *n; n++)
+    if (strcmp(*n, env) == 0)
+      return true;
+  return false;
+}
+
+// Verbatim text from line[i] up to `end` (which closes it), returning the
+// index after `end`, or n if the text continues on the next line.
+static int sync_verbatim(const int *line, int n, int i, const char *end,
+                         bool hidden, struct sync_text *t, bool *closed)
+{
+  bool in_word = false;
+  *closed = false;
+  for (; i < n; i++)
+  {
+    if (sync_looking_at(line, n, i, end))
+    {
+      *closed = true;
+      return i + strlen(end);
+    }
+    int f = hidden ? 0 : txp_fold_char(line[i]);
+    if (f)
+      sync_add_char(t, &in_word, i, f, 0);
+    else
+      in_word = false;
+  }
+  return n;
+}
+
+// Verbatim environment lines up to \end{t->verbatim}, leaving it there.
+static int sync_verbatim_environment(const int *line, int n, int i,
+                                     struct sync_text *t)
+{
+  char end[48];
+  snprintf(end, sizeof(end), "\\end{%s}", t->verbatim);
+  bool closed;
+  i = sync_verbatim(line, n, i, end, t->hidden, t, &closed);
+  if (closed)
+    t->verbatim[0] = 0;
+  return i;
+}
+
+static void sync_segment_open(struct sync_text *t, enum sync_segment_kind kind)
+{
+  if (t->nsegments == SYNC_SEGMENT_DEPTH)
+    return;
+  t->segment[t->nsegments] = ++t->open;
+  t->segment_depth[t->nsegments] = t->depth + 1;
+  t->segment_kind[t->nsegments] = kind;
+  t->nsegments++;
+}
+
+static bool sync_in_node(struct sync_text *t)
+{
+  return t->nsegments > 0 &&
+         t->segment_kind[t->nsegments - 1] == SYNC_SEGMENT_NODE;
+}
+
+// The name of the environment in the group at line[i], as in {figure}.
+static void sync_environment(const int *line, int n, int i, char *name, int size)
+{
+  int k = 0;
+  if (i < n && line[i] == '{')
+    for (i++; i < n && line[i] != '}' && k < size - 1; i++)
+      name[k++] = line[i];
+  name[k] = 0;
+}
+
+static bool sync_is_float(const char *env)
+{
+  static const char *names[] = {
+    "figure", "figure*", "table", "table*", "algorithm", "algorithm*",
+    "wrapfigure", "wraptable", "marginfigure", "margintable", NULL
+  };
+  for (const char **n = names; *n; n++)
+    if (strcmp(*n, env) == 0)
+      return true;
+  return false;
+}
+
+// Environments whose arguments are not text: \begin{tabular}{p{1in}l}.
+// Those of other environments are often titles.
+static bool sync_env_skips_arguments(const char *env)
+{
+  static const char *names[] = {
+    "tabular", "tabular*", "tabularx", "tabulary", "array", "longtable",
+    "minipage", "wrapfigure", "wraptable", "multicols", "multicols*",
+    "minted", "thebibliography", "subfigure", "list", "tikzpicture", NULL
+  };
+  for (const char **n = names; *n; n++)
+    if (strcmp(*n, env) == 0)
+      return true;
+  return false;
+}
+
+// Macros whose argument is typeset away from the running text.
+static bool sync_macro_moves_argument(const char *name)
+{
+  return strcmp(name, "footnote") == 0 || strcmp(name, "footnotetext") == 0 ||
+         strcmp(name, "thanks") == 0 || strcmp(name, "marginpar") == 0;
+}
+
+// Headings: before their text, the page has at most a number (A.1.2).
+#define SYNC_NUMBER_GAP 8
+static bool sync_macro_is_heading(const char *name)
+{
+  static const char *names[] = {
+    "part", "chapter", "section", "subsection", "subsubsection", "paragraph",
+    "subparagraph", NULL
+  };
+  for (const char **p = names; *p; p++)
+    if (strcmp(name, *p) == 0)
+      return true;
+  return false;
+}
 
 static bool sync_macro_skips_argument(const char *name)
 {
@@ -286,12 +479,18 @@ static int sync_skip_group(const int *line, int n, int i, int open, int close)
 
 // Split a source line into the words likely to be typeset as text: macro
 // names, math, optional arguments, and the arguments of macros that do not
-// typeset text are left out.
+// typeset text are left out. The words are appended to t, which also keeps
+// track of the segments (see sync_word) from line to line.
 static void sync_source_words(const int *line, int n, struct sync_text *t)
 {
-  t->nchars = t->nwords = 0;
   bool math = false, in_word = false;
+  int gap = 0;
+  // Brackets right after a macro hold an optional argument (\item[...],
+  // \\[2pt]); elsewhere they are text.
+  bool after_macro = false;
   int i = 0;
+  if (t->verbatim[0])
+    i = sync_verbatim_environment(line, n, 0, t);
   while (i < n && t->nchars < SYNC_TEXT_MAX && t->nwords < SYNC_TEXT_MAX)
   {
     int c = line[i];
@@ -313,8 +512,39 @@ static void sync_source_words(const int *line, int n, struct sync_text *t)
         }
         name[k] = 0;
         in_word = false;
+        gap = sync_macro_is_heading(name) ? SYNC_NUMBER_GAP : TXP_TEXT_MAX_GAP;
         i = j;
-        if (!math && sync_macro_skips_argument(name))
+        if (t->tikz && !sync_in_node(t) && strcmp(name, "node") == 0)
+          t->node = true;
+        bool mint = strcmp(name, "mintinline") == 0;
+        if (!math && (mint || strcmp(name, "verb") == 0 ||
+                      strcmp(name, "lstinline") == 0))
+        {
+          // \verb|code|, \mintinline{lang}{code}, \lstinline[opts]|code|
+          if (i < n && line[i] == '*')
+            i++;
+          if (i < n && line[i] == '[')
+            i = sync_skip_group(line, n, i, '[', ']');
+          if (mint && i < n && line[i] == '{')
+            i = sync_skip_group(line, n, i, '{', '}');
+          if (i < n)
+          {
+            char end[2] = {line[i] == '{' ? '}' : (char)line[i], 0};
+            bool closed;
+            i = sync_verbatim(line, n, i + 1, end, false, t, &closed);
+          }
+          continue;
+        }
+        if (!math && sync_macro_moves_argument(name))
+        {
+          while (i < n && line[i] == ' ')
+            i++;
+          if (i < n && line[i] == '[')
+            i = sync_skip_group(line, n, i, '[', ']');
+          if (i < n && line[i] == '{')
+            sync_segment_open(t, SYNC_SEGMENT_ARGUMENT);
+        }
+        else if (!math && sync_macro_skips_argument(name))
         {
           if (strcmp(name, "def") == 0)
             // \def\name{...}
@@ -324,18 +554,52 @@ static void sync_source_words(const int *line, int n, struct sync_text *t)
             i++;
           if (i < n && line[i] == '[')
             i = sync_skip_group(line, n, i, '[', ']');
+          bool begin = strcmp(name, "begin") == 0;
+          if (begin || strcmp(name, "end") == 0)
+          {
+            char env[32];
+            sync_environment(line, n, i, env, sizeof(env));
+            if (sync_is_float(env) && begin)
+              sync_segment_open(t, SYNC_SEGMENT_FLOAT);
+            else if (sync_is_float(env))
+            {
+              while (t->nsegments > 0 &&
+                     t->segment_kind[--t->nsegments] != SYNC_SEGMENT_FLOAT)
+                ;
+            }
+            else if (strcmp(env, "tikzpicture") == 0)
+              t->tikz += begin ? 1 : t->tikz > 0 ? -1 : 0;
+            if (i < n && line[i] == '{')
+              i = sync_skip_group(line, n, i, '{', '}');
+            // The arguments of an environment follow its name:
+            // \begin{tabular}{p{1in}l}, \begin{figure}[t].
+            bool args = begin && sync_env_skips_arguments(env);
+            while (i < n && (line[i] == '[' || (args && line[i] == '{')))
+              i = line[i] == '[' ? sync_skip_group(line, n, i, '[', ']')
+                                 : sync_skip_group(line, n, i, '{', '}');
+            if (begin && sync_is_verbatim(env))
+            {
+              strcpy(t->verbatim, env);
+              t->hidden = strcmp(env, "comment") == 0;
+              i = sync_verbatim_environment(line, n, i, t);
+            }
+            continue;
+          }
           if (i < n && line[i] == '{')
             i = sync_skip_group(line, n, i, '{', '}');
-          if (i < n && line[i] == '[')
+          while (i < n && line[i] == '[')
             i = sync_skip_group(line, n, i, '[', ']');
         }
+        else
+          after_macro = true;
         continue;
       }
       if (d == '(' || d == '[')
-        math = true, in_word = false;
+        math = true, in_word = false, gap = TXP_TEXT_MAX_GAP;
       else if (d == ')' || d == ']')
         math = false, in_word = false;
       // Other control symbols (accents, \_, \&, ...) do not split words.
+      after_macro = d == '\\';
       i += 2;
       continue;
     }
@@ -343,6 +607,7 @@ static void sync_source_words(const int *line, int n, struct sync_text *t)
     {
       math = !math;
       in_word = false;
+      gap = TXP_TEXT_MAX_GAP;
       i++;
       continue;
     }
@@ -351,29 +616,59 @@ static void sync_source_words(const int *line, int n, struct sync_text *t)
       i++;
       continue;
     }
-    if (c == '[')
+    if (c == '[' && after_macro)
     {
-      in_word = false;
+      in_word = after_macro = false;
       i = sync_skip_group(line, n, i, '[', ']');
       continue;
+    }
+    if (t->tikz && !sync_in_node(t) && c != '{' && c != '}')
+    {
+      // Drawing commands: only the text of nodes is typeset. The options and
+      // the name or position of a node come before its text.
+      in_word = false;
+      if (c == '[' || c == '(')
+      {
+        i = sync_skip_group(line, n, i, c, c == '[' ? ']' : ')');
+        continue;
+      }
+      int j = i;
+      while (j < n && ((line[j] >= 'a' && line[j] <= 'z') ||
+                       (line[j] >= 'A' && line[j] <= 'Z')))
+        j++;
+      if (j == i + 4 && line[i] == 'n' && line[i + 1] == 'o' &&
+          line[i + 2] == 'd' && line[i + 3] == 'e')
+        t->node = true;
+      i = j > i ? j : i + 1;
+      continue;
+    }
+    if (c != ' ' && c != '*')
+      after_macro = false;
+    if (c == '{')
+    {
+      if (t->tikz && t->node && !sync_in_node(t))
+        sync_segment_open(t, SYNC_SEGMENT_NODE);
+      t->node = false;
+      t->depth++;
+    }
+    else if (c == '}')
+    {
+      if (t->nsegments > 0 &&
+          t->segment_kind[t->nsegments - 1] != SYNC_SEGMENT_FLOAT &&
+          t->segment_depth[t->nsegments - 1] == t->depth)
+      {
+        // Back to the text around the footnote, after its mark.
+        t->nsegments--;
+        in_word = false;
+        gap = TXP_TEXT_MAX_GAP;
+      }
+      t->depth--;
     }
     int f = txp_fold_char(c);
     if (f)
     {
-      if (!in_word)
-      {
-        struct sync_word *w = &t->words[t->nwords++];
-        w->start = i;
-        w->first = t->nchars;
-        w->count = 0;
-        in_word = true;
-      }
-      struct sync_word *w = &t->words[t->nwords - 1];
-      t->chars[t->nchars] = f;
-      t->source[t->nchars] = i;
-      t->nchars++;
-      w->count++;
-      w->end = i + 1;
+      sync_add_char(t, &in_word, i, f, gap);
+      gap = 0;
     }
     else if (c != '{' && c != '}')
       in_word = false;
@@ -381,87 +676,414 @@ static void sync_source_words(const int *line, int n, struct sync_text *t)
   }
 }
 
-static bool sync_refine_by_text(struct persistent_state *ps, ui_state *ui,
-                                fz_point anchor, fz_rect region, bool region_only,
-                                fz_point *out, fz_rect *out_line)
+// The contents of a file of the document, as the editor last sent it.
+static fz_buffer *sync_file_data(struct persistent_state *ps, ui_state *ui,
+                                 const char *path)
 {
-  int column = ui->sync_target.column;
-  if (column < 0 || !ui->sync_target.path[0])
-    return false;
+  fileentry_t *e = send(find_file, ui->eng, ps->ctx, path);
+  return e ? (e->edit_data ? e->edit_data : e->fs_data) : NULL;
+}
 
-  fileentry_t *e = send(find_file, ui->eng, ps->ctx, ui->sync_target.path);
-  fz_buffer *data = e ? (e->edit_data ? e->edit_data : e->fs_data) : NULL;
-  if (!data)
-    return false;
-
-  // Find the line (1-based) and decode it.
+// The start of a line (1-based) of a file, NULL past its end.
+static const char *sync_line_start(fz_buffer *data, int line)
+{
   const char *p = (const char *)data->data, *end = p + data->len;
-  for (int l = 1; l < ui->sync_target.line && p < end; l++)
+  for (int l = 1; l < line && p < end; l++)
   {
     const char *nl = memchr(p, '\n', end - p);
     p = nl ? nl + 1 : end;
   }
-  if (p >= end)
-    return false;
-  static int line[4096];
+  return p < end ? p : NULL;
+}
+
+// Decode the line starting at p into code points (at most SYNC_TEXT_MAX),
+// returning their number, and the start of the next line in *next.
+static int sync_decode_line(fz_buffer *data, const char *p, int *line,
+                            const char **next)
+{
+  const char *end = (const char *)data->data + data->len;
   int n = 0;
-  while (p < end && *p != '\n' && n < 4096)
+  while (p < end && *p != '\n')
   {
     int c;
     p += fz_chartorune(&c, p);
-    line[n++] = c;
+    if (n < SYNC_TEXT_MAX)
+      line[n++] = c;
   }
+  *next = p < end ? p + 1 : NULL;
+  return n;
+}
 
+// Start reading the lines of a file from `first` into t: the lines before it
+// (at most SYNC_CONTEXT_LINES) tell which floats, footnotes and TikZ
+// pictures are open. Returns the start of line `first`.
+#define SYNC_CONTEXT_LINES 300
+
+static const char *sync_text_begin(fz_buffer *data, int first,
+                                   struct sync_text *t)
+{
+  static int line[SYNC_TEXT_MAX];
+  int l = first > SYNC_CONTEXT_LINES ? first - SYNC_CONTEXT_LINES : 1;
+  const char *p = sync_line_start(data, l);
+  sync_text_reset(t);
+  for (; p && l < first; l++)
+  {
+    int n = sync_decode_line(data, p, line, &p);
+    sync_source_words(line, n, t);
+    t->nchars = t->nwords = 0;
+  }
+  return p;
+}
+
+// Forward: the position of the editor cursor (ui->sync_target) in the text
+// of the displayed page, with the length of the matched text (0 if not
+// found; only text of at least min_len characters is looked for, *max_len is
+// the longest). With `nearest`, SyncTeX found the target line
+// with a column: take the occurrence of the words around the cursor
+// nearest to the anchor. Otherwise, prefer an occurrence in `region`, then
+// the first one after the anchor in reading order.
+#define SYNC_NEAREST_MAX 300
+
+static int sync_refine_by_text(struct persistent_state *ps, ui_state *ui,
+                               fz_point anchor, fz_rect region, bool region_only,
+                               bool nearest, int min_len, int *max_len,
+                               fz_point *out, fz_rect *out_line)
+{
+  *max_len = 0;
+  int column = ui->sync_target.column;
+  if (column < 0 || !ui->sync_target.path[0])
+    return 0;
+
+  int target = ui->sync_target.line;
+  fz_buffer *data = sync_file_data(ps, ui, ui->sync_target.path);
   static struct sync_text t;
-  sync_source_words(line, n, &t);
-  if (t.nwords == 0)
-    return false;
+  int first = target > 2 ? target - 2 : 1;
+  const char *p = data ? sync_text_begin(data, first, &t) : NULL;
+  if (!p)
+    return 0;
+
+  // The words of the target line, [w0, w1), with those of the lines around
+  // it (two before, at least three words after): the text flows across
+  // source lines, and lines without words (markup, blank lines) do not
+  // count.
+  static int line[SYNC_TEXT_MAX];
+  int w0 = 0, w1 = 0;
+  for (int l = first; p && (l <= target + 1 ||
+                            (l <= target + 8 && t.nwords - w1 < 3)); l++)
+  {
+    int n = sync_decode_line(data, p, line, &p);
+    if (l == target)
+      w0 = t.nwords;
+    sync_source_words(line, n, &t);
+    if (l == target)
+      w1 = t.nwords;
+  }
+  if (w0 == w1)
+    return 0;
 
   // The word under the cursor (or right before it), else the next one, else
   // the last one.
   int k = -1;
-  for (int i = 0; i < t.nwords; i++)
+  for (int i = w0; i < w1; i++)
     if (t.words[i].start <= column && column <= t.words[i].end)
     {
       k = i;
       break;
     }
   if (k == -1)
-    for (int i = 0; i < t.nwords && k == -1; i++)
+    for (int i = w0; i < w1 && k == -1; i++)
       if (t.words[i].start > column)
         k = i;
   if (k == -1)
-    k = t.nwords - 1;
+    k = w1 - 1;
 
-  // Number of folded characters of word k before the cursor.
+  // Number of folded characters of word k before the cursor. The cursor is
+  // at the left edge of the next one, or at the right edge of the previous
+  // one when it follows it directly (at the end of the word, or before
+  // markup inside it, as in d|\_in).
   int in_word = 0;
-  while (in_word < t.words[k].count &&
-         t.source[t.words[k].first + in_word] < column)
+  const int *src = t.source + t.words[k].first;
+  while (in_word < t.words[k].count && src[in_word] < column)
     in_word++;
+  bool after = in_word == t.words[k].count ||
+               (in_word > 0 && src[in_word - 1] == column - 1 &&
+                src[in_word] > column);
+
+  // The words typeset with word k: those of its segment.
+  static int seq[SYNC_TEXT_MAX];
+  int nseq = 0, kk = 0;
+  for (int i = 0; i < t.nwords; i++)
+    if (t.words[i].segment == t.words[k].segment)
+    {
+      if (i == k)
+        kk = nseq;
+      seq[nseq++] = i;
+    }
 
   // Try the longest needles first: a single short word matches anywhere.
   static const int spans[][2] = {{0, 2}, {-1, 1}, {0, 1}, {-1, 0}, {-2, 0}, {0, 0}};
+  static int needle[SYNC_TEXT_MAX];
+  static unsigned char gap[SYNC_TEXT_MAX];
   for (int s = 0; s < (int)(sizeof(spans) / sizeof(spans[0])); s++)
   {
-    int a = k + spans[s][0], b = k + spans[s][1];
-    if (a < 0 || b >= t.nwords)
+    int a = kk + spans[s][0], b = kk + spans[s][1];
+    if (a < 0 || b >= nseq)
       continue;
-    int first = t.words[a].first;
-    int len = t.words[b].first + t.words[b].count - first;
-    if (len < 4 || (a == b && len < 5))
-      continue;
-    int offset = t.words[k].first - first + in_word;
-    if (txp_renderer_find_text(ps->ctx, ui->doc_renderer, t.chars + first, len,
-                               offset, anchor, region, out, out_line))
+    int len = 0, offset = 0;
+    for (int m = a; m <= b; m++)
     {
-      if (region_only &&
-          !fz_is_point_inside_rect(*out, fz_expand_rect(region, 2)))
-        // Matched outside the picture only: not trustworthy.
-        return false;
+      struct sync_word *w = &t.words[seq[m]];
+      if (m == kk)
+        offset = len + in_word - (after ? 1 : 0);
+      memcpy(needle + len, t.chars + w->first, w->count * sizeof(int));
+      memcpy(gap + len, t.gap + w->first, w->count);
+      // Words of other segments in between: the page has a mark there.
+      if (m > a && seq[m] != seq[m - 1] + 1)
+        gap[len] = TXP_TEXT_MAX_GAP;
+      len += w->count;
+    }
+    // A single word of four letters only as a last resort, near the anchor
+    // or inside the region.
+    if (len < 4 || (a == b && len < (nearest || region_only ? 4 : 5)))
+      continue;
+    if (len > *max_len)
+      *max_len = len;
+    if (len < min_len)
+      continue;
+    fz_point pt;
+    fz_rect lb;
+    bool matched = txp_renderer_find_text(ps->ctx, ui->doc_renderer, needle,
+                                          gap, len, offset, after, anchor, region,
+                                          nearest ? SYNC_NEAREST_MAX : -1, &pt, &lb);
+    if (getenv("TXP_SYNC_DEBUG"))
+    {
+      fprintf(stderr, "[synctex forward] needle ");
+      for (int i = 0; i < len; i++)
+      {
+        char utf8[FZ_UTFMAX + 1];
+        utf8[fz_runetochar(utf8, needle[i])] = 0;
+        fprintf(stderr, "%s%s%s", i == offset ? "^" : "", gap[i] ? "|" : "", utf8);
+      }
+      if (matched)
+        fprintf(stderr, ": (%.2f, %.2f)\n", pt.x, pt.y);
+      else
+        fprintf(stderr, ": no match\n");
+    }
+    if (!matched)
+      continue;
+    if (region_only && !fz_is_point_inside_rect(pt, fz_expand_rect(region, 2)))
+      // Matched outside the picture only: not trustworthy.
+      return 0;
+    *out = pt;
+    *out_line = lb;
+    return len;
+  }
+  return 0;
+}
+
+// Backward: the source position of the text at `pt` on the displayed page.
+// The characters around pt are aligned with the text of the source lines
+// around the SyncTeX candidate (*line, 1-based, and *column, the cursor
+// position before the material or -1): the longest match wins, ties go to
+// the nearest one. Text of the page that is not in the source (math,
+// references, citations, macros) is skipped where the source has material
+// left out; a click on such text goes to that material. On success, *line
+// and *column are updated.
+#define SYNC_BACK_RADIUS 80
+#define SYNC_BACK_LINES_BEFORE 120
+#define SYNC_BACK_LINES_AFTER 30
+#define SYNC_BACK_MIN_MATCH 5
+
+struct sync_char {
+  int c, line, column;
+  bool gap;        // material left out before this character
+  int gap_column;  // where it starts
+  int segment, order;
+};
+
+static int sync_char_compare(const void *a, const void *b)
+{
+  const struct sync_char *x = a, *y = b;
+  if (x->segment != y->segment)
+    return x->segment < y->segment ? -1 : 1;
+  return x->order - y->order;
+}
+
+// Whether src[s...] matches rendered[r...] in direction dir, up to the next
+// gap, over at most TXP_TEXT_LOOKAHEAD characters.
+static bool sync_match_ahead(const struct sync_char *src, int ns, int s,
+                             const int *rendered, int nr, int r, int dir)
+{
+  for (int m = 0; m < TXP_TEXT_LOOKAHEAD; m++, s += dir, r += dir)
+  {
+    if (s < 0 || s >= ns)
       return true;
+    if (m > 0 && (dir > 0 ? src[s].gap : src[s + 1].gap))
+      return true;
+    if (r < 0 || r >= nr || src[s].c != rendered[r])
+      return false;
+  }
+  return true;
+}
+
+// Number of characters of src from s matching those of rendered from r, in
+// direction dir. At a gap of the source, at most TXP_TEXT_MAX_GAP rendered
+// characters are skipped: the fewest after which the source goes on
+// matching.
+static int sync_match_run(const struct sync_char *src, int ns, int s,
+                          const int *rendered, int nr, int r, int dir)
+{
+  int count = 0;
+  for (; s >= 0 && s < ns && r >= 0 && r < nr; s += dir, r += dir, count++)
+  {
+    // The gap between src[s] and the character matched before it.
+    bool gap = dir > 0 ? src[s].gap : src[s + 1].gap;
+    if (!gap)
+    {
+      if (src[s].c != rendered[r])
+        break;
+      continue;
+    }
+    int k = 0;
+    while (k <= TXP_TEXT_MAX_GAP &&
+           !sync_match_ahead(src, ns, s, rendered, nr, r + dir * k, dir))
+      k++;
+    if (k > TXP_TEXT_MAX_GAP)
+      break;
+    r += dir * k;
+    if (r < 0 || r >= nr)
+      break;
+  }
+  return count;
+}
+
+static bool sync_backward_by_text(struct persistent_state *ps, ui_state *ui,
+                                  fz_point pt, const char *path,
+                                  int *line, int *column)
+{
+  int rendered[2 * SYNC_BACK_RADIUS + 1], at;
+  bool after;
+  int nr = txp_renderer_text_at(ps->ctx, ui->doc_renderer, pt,
+                                SYNC_BACK_RADIUS, rendered, &at, &after);
+  if (nr == 0)
+    return false;
+
+  fz_buffer *data = sync_file_data(ps, ui, path);
+  int first_line = *line > SYNC_BACK_LINES_BEFORE ? *line - SYNC_BACK_LINES_BEFORE : 1;
+  static struct sync_text t;
+  const char *p = data ? sync_text_begin(data, first_line, &t) : NULL;
+  if (!p)
+    return false;
+
+  // Folded characters of the source lines, with their line and column.
+  struct sync_char *src = NULL;
+  int ns = 0, cap = 0;
+  static int text[SYNC_TEXT_MAX];
+  for (int l = first_line; p && l <= *line + SYNC_BACK_LINES_AFTER; l++)
+  {
+    int n = sync_decode_line(data, p, text, &p);
+    t.nchars = t.nwords = 0;
+    sync_source_words(text, n, &t);
+    if (ns + t.nchars > cap)
+    {
+      cap = (ns + t.nchars) * 2;
+      src = fz_realloc(ps->ctx, src, cap * sizeof(*src));
+    }
+    for (int i = 0; i < t.nchars; i++, ns++)
+    {
+      src[ns].c = t.chars[i];
+      src[ns].line = l;
+      src[ns].column = t.source[i];
+      src[ns].gap = t.gap[i];
+      // Material left out starts after the previous word of the line.
+      int g = i > 0 ? t.source[i - 1] + 1 : 0;
+      while (g < t.source[i] && (text[g] == ' ' || text[g] == '\t'))
+        g++;
+      src[ns].gap_column = g;
+      src[ns].order = ns;
+    }
+    for (int w = 0; w < t.nwords; w++)
+      for (int i = 0; i < t.words[w].count; i++)
+        src[ns - t.nchars + t.words[w].first + i].segment = t.words[w].segment;
+  }
+
+  // The running text first, then each footnote: the text of each is
+  // contiguous on the page, with a mark where a footnote was.
+  qsort(src, ns, sizeof(*src), sync_char_compare);
+  for (int s = 1; s < ns; s++)
+    if (src[s].order != src[s - 1].order + 1)
+      src[s].gap = true;
+  if (getenv("TXP_SYNC_DEBUG"))
+  {
+    for (int s = 0; s < ns; s++)
+    {
+      if (s == 0 || src[s].segment != src[s - 1].segment)
+        fprintf(stderr, "\n[%d] %d:", src[s].segment, src[s].line);
+      fprintf(stderr, "%s%c", src[s].gap ? "|" : "", src[s].c);
+    }
+    fprintf(stderr, "\nrendered: ");
+    for (int r = 0; r < nr; r++)
+      fprintf(stderr, r == at ? "[%c]" : "%c", rendered[r]);
+    fprintf(stderr, "\n");
+  }
+
+  // Candidates: the clicked character is src[s], or it is part of the text
+  // that the gap before src[s] stands for.
+  int best = -1, best_score = 0;
+  bool best_in_gap = false;
+  long best_dist = 0;
+  for (int s = 0; s < ns; s++)
+  {
+    int score = 0;
+    bool in_gap = false;
+    if (src[s].c == rendered[at])
+      score = 1 + sync_match_run(src, ns, s + 1, rendered, nr, at + 1, 1) +
+              sync_match_run(src, ns, s - 1, rendered, nr, at - 1, -1);
+    if (src[s].gap)
+    {
+      // The first match of src[s...] after the click and of src[...s-1]
+      // before it, around at most TXP_TEXT_MAX_GAP characters.
+      int r1 = at + 1, r0 = at - 1;
+      while (r1 < nr && r1 - at <= TXP_TEXT_MAX_GAP &&
+             !sync_match_ahead(src, ns, s, rendered, nr, r1, 1))
+        r1++;
+      while (r0 >= 0 && at - r0 <= TXP_TEXT_MAX_GAP &&
+             !sync_match_ahead(src, ns, s - 1, rendered, nr, r0, -1))
+        r0--;
+      if (r1 < nr && r0 >= 0 && r1 - r0 - 1 <= TXP_TEXT_MAX_GAP && s > 0)
+      {
+        int gs = sync_match_run(src, ns, s, rendered, nr, r1, 1) +
+                 sync_match_run(src, ns, s - 1, rendered, nr, r0, -1);
+        if (gs > score)
+          score = gs, in_gap = true;
+      }
+    }
+    if (score == 0)
+      continue;
+    long dist = labs((long)src[s].line - *line) * 100000;
+    if (src[s].line == *line && *column >= 0)
+      dist += labs((long)src[s].column - *column);
+    if (score > best_score || (score == best_score && dist < best_dist))
+    {
+      best = s;
+      best_score = score;
+      best_dist = dist;
+      best_in_gap = in_gap;
     }
   }
-  return false;
+
+  bool found = best >= 0 && best_score >= SYNC_BACK_MIN_MATCH;
+  if (found)
+  {
+    *line = src[best].line;
+    *column = best_in_gap ? src[best].gap_column
+                          : src[best].column + (after ? 1 : 0);
+    fprintf(stderr, "[synctex backward] refined by text: line %d column %d "
+            "(%d characters match%s)\n",
+            *line, *column, best_score, best_in_gap ? ", in a gap" : "");
+  }
+  fz_free(ps->ctx, src);
+  return found;
 }
 
 static void render(fz_context *ctx, ui_state *ui)
@@ -584,6 +1206,40 @@ static void mouse_position_in_points(int *x, int *y)
 /* Hyperlinks */
 
 static void display_page(struct persistent_state *ps, ui_state *ui);
+
+static const char *relative_path(const char *path, const char *dir, int *go_up);
+
+// Backward SyncTeX from a point of the displayed page, in document units
+static void sync_backward(struct persistent_state *ps, ui_state *ui, fz_point pt)
+{
+  fz_buffer *buf;
+  synctex_t *stx = send(synctex, ui->eng, &buf);
+  if (!stx || !buf)
+    return;
+  float f = 1 / send(scale_factor, ui->eng);
+  fprintf(stderr, "click: (%f,%f) mapped:(%f,%f)\n",
+          pt.x, pt.y, f * pt.x, f * pt.y);
+  const char *name;
+  int name_len, line, column;
+  if (!synctex_scan(ps->ctx, stx, buf, ui->page, f * pt.x, f * pt.y,
+                    &name, &name_len, &line, &column))
+    return;
+
+  // Files of the document are known relative to its directory.
+  char path[1024];
+  snprintf(path, sizeof(path), "%.*s", name_len, name);
+  const char *rel = path;
+  int go_up = 0;
+  if (rel[0] == '/')
+    rel = relative_path(rel, ps->doc_path, &go_up);
+  while (rel[0] == '.' && rel[1] == '/')
+    rel += 2;
+  if (go_up == 0)
+    sync_backward_by_text(ps, ui, pt, rel, &line, &column);
+
+  // The editor gets a 1-based column, 0 if unknown.
+  editor_synctex(ps->doc_path, name, name_len, line, column >= 0 ? column + 1 : 0);
+}
 
 // Link of the displayed page under a screen position (in pixels)
 static fz_link *link_at(fz_context *ctx, ui_state *ui, fz_point p)
@@ -746,18 +1402,8 @@ static void ui_mouse_down(struct persistent_state *ps, ui_state *ui, int x, int 
       diff = txp_renderer_select_char(ps->ctx, ui->doc_renderer, p) || diff;
       ui->last_click_ticks = ticks;
 
-      fz_buffer *buf;
-      synctex_t *stx = send(synctex, ui->eng, &buf);
-      if (stx && buf)
-      {
-        fz_point pt = txp_renderer_screen_to_document(ps->ctx, ui->doc_renderer, p);
-        float f = 1 / send(scale_factor, ui->eng);
-        // pt.x -= 72;
-        // pt.y -= 72;
-        fprintf(stderr, "click: (%f,%f) mapped:(%f,%f)\n",
-                pt.x, pt.y, f * pt.x, f * pt.y);
-        synctex_scan(ps->ctx, stx, buf, ps->doc_path, ui->page, f * pt.x, f * pt.y);
-      }
+      sync_backward(ps, ui,
+                    txp_renderer_screen_to_document(ps->ctx, ui->doc_renderer, p));
     }
 
     if (diff)
@@ -1606,6 +2252,45 @@ static void interpret_command(struct persistent_state *ps,
       fprintf(stderr, "[command] stay-on-top %d\n", cmd.stay_on_top.status);
       break;
 
+    case EDIT_TEST_CLICK:
+    case EDIT_TEST_PAGE_TEXT:
+    {
+      int page = cmd.tag == EDIT_TEST_CLICK ? cmd.test_click.page
+                                            : cmd.test_page_text.page;
+      if (page < 0 || page >= send(page_count, ui->eng))
+      {
+        fprintf(stderr, "[test] page %d is not available\n", page);
+        break;
+      }
+      if (page != ui->page)
+      {
+        ui->page = page;
+        display_page(ps, ui);
+      }
+      // Replies go to stdout, the [test] markers to stderr: flush stdout
+      // before each marker so that a reader sees the reply first.
+      if (cmd.tag == EDIT_TEST_CLICK)
+      {
+        sync_backward(ps, ui, fz_make_point(cmd.test_click.x, cmd.test_click.y));
+        fflush(stdout);
+        fprintf(stderr, "[test] click done\n");
+      }
+      else
+      {
+        FILE *f = fopen(cmd.test_page_text.path, "w");
+        if (!f)
+          fprintf(stderr, "[test] cannot write %s\n", cmd.test_page_text.path);
+        else
+        {
+          txp_renderer_dump_text(ps->ctx, ui->doc_renderer, f);
+          fclose(f);
+          fprintf(stderr, "[test] page text written\n");
+        }
+      }
+      fflush(stdout);
+    }
+    break;
+
     case EDIT_SYNCTEX_FORWARD:
     {
       fz_buffer *buf;
@@ -1987,7 +2672,7 @@ bool texpresso_main(struct persistent_state *ps)
         bool no_caret = false;
 
         int precision = synctex_candidate_imprecise(stx);
-        if (precision && page == ui->page)
+        if (page == ui->page)
         {
           bool floating = precision & SYNCTEX_FLOATING;
           // Only trust matches inside the picture when the target line
@@ -1995,8 +2680,48 @@ bool texpresso_main(struct persistent_state *ps)
           bool in_picture = floating && !(precision & SYNCTEX_OTHER_LINE);
           fz_point tp;
           fz_rect tl;
-          if (sync_refine_by_text(ps, ui, p, floating ? mark_box : fz_empty_rect,
-                                  in_picture, &tp, &tl))
+          int max_len;
+          int found = sync_refine_by_text(
+              ps, ui, p, floating ? mark_box : fz_empty_rect, in_picture,
+              !precision, 0, &max_len, &tp, &tl);
+          // Only a part of the text around the cursor is on the page: a
+          // paragraph can go on on the next page (or start on the previous
+          // one), where SyncTeX has no record of the target line, and the
+          // last lines of a paragraph have the number of the line after it.
+          // Unless SyncTeX found the line itself (then the text continues
+          // past a page break, or repeats), take a longer match on the next
+          // page (its first occurrence), else on the previous page (its last
+          // one).
+          for (int d = 1; found < max_len && !floating && (precision || !found) &&
+                          d >= -1; d -= 2)
+          {
+            int other = page + d;
+            if (other < 0 || other >= send(page_count, ui->eng))
+              continue;
+            ui->page = other;
+            display_page(ps, ui);
+            fz_point start = d > 0 ? fz_make_point(0, 0)
+                                   : fz_make_point(INFINITY, INFINITY);
+            fz_point op;
+            fz_rect ol;
+            int other_max;
+            int len = sync_refine_by_text(ps, ui, start, fz_empty_rect, false,
+                                          false, found + 1, &other_max, &op, &ol);
+            if (len > found)
+            {
+              found = len;
+              page = other;
+              tp = op;
+              tl = ol;
+            }
+          }
+          bool refined = found > 0;
+          if (ui->page != page)
+          {
+            ui->page = page;
+            display_page(ps, ui);
+          }
+          if (refined)
           {
             fprintf(stderr, "[synctex forward] refined by text: (%.02f, %.02f)\n",
                     tp.x, tp.y);
@@ -2008,6 +2733,10 @@ bool texpresso_main(struct persistent_state *ps)
             // is drawn: only highlight the picture.
             no_caret = floating;
         }
+        fprintf(stderr, "[synctex forward] mark: page %d at (%.2f, %.2f) "
+                "line (%.2f, %.2f)-(%.2f, %.2f) caret %d precision %d\n",
+                page, p.x, p.y, mark_box.x0, mark_box.y0, mark_box.x1, mark_box.y1,
+                !no_caret, precision);
         fz_point pt = txp_renderer_document_to_screen(ps->ctx, ui->doc_renderer, p);
 
         ui->sync_mark.active = true;
