@@ -1217,12 +1217,9 @@ static bool engine_step(txp_engine *_self, fz_context *ctx, bool restart_if_need
       return 0;
     if (!channel_has_pending_query(self->c, fd, 10))
       return 0;
+    // On failure, read_query already closed the process and its fd
     if (!read_query(self, self->c, &q))
-    {
-      close(fd);
-      get_process(self)->fd = -1;
       return 0;
-    }
     answer_query(ctx, self, &q);
     channel_flush(self->c, fd);
     return 1;

@@ -77,23 +77,12 @@ pid_t texpresso_fork_with_channel(int fd, uint32_t time)
   {
     // In parent: send other end of new socket to driver
     send_child_fd(fd, child, time, sockets[0]);
-
-    // Release the new socket before waiting: while this process holds the
-    // driver's end, the child cannot see the driver exit and never ends.
-    PERROR(close(sockets[0]));
     PERROR(close(sockets[1]));
 
-    // Wait for process to end
-    int status;
-    while (waitpid(child, &status, 0) == -1)
-    {
-      if (errno == EINTR)
-        continue;
-      perror("waitpid");
-      return 1;
-    }
-
-    // Resume handling
+    // Wait for the driver to acknowledge the child before releasing its end
+    // of the new socket. Until the driver has received it, the in-flight
+    // message is its only other reference: closing ours then sometimes left
+    // the driver reading EOF from a live child, cutting passes short.
     char answer[4];
     int recvd;
     do {
@@ -115,6 +104,20 @@ pid_t texpresso_fork_with_channel(int fd, uint32_t time)
             "recvd: %d, answer: %C%C%C%C",
             recvd,
             answer[0], answer[1], answer[2], answer[3]);
+
+    // Release the driver's end before waiting: while this process holds it,
+    // the child cannot see the driver exit and never ends.
+    PERROR(close(sockets[0]));
+
+    // Wait for process to end, then resume where the fork happened
+    int status;
+    while (waitpid(child, &status, 0) == -1)
+    {
+      if (errno == EINTR)
+        continue;
+      perror("waitpid");
+      return 1;
+    }
   }
 
   return child;
