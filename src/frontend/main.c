@@ -4764,16 +4764,24 @@ bool texpresso_main(struct persistent_state *ps)
 
           case SDLK_j:
             if (SDL_GetModState() & KMOD_SHIFT)
-              ui_pan(ps->ctx, ui, -1.0/5.0); // Medium down-pan
+              next_page(ps->ctx, ui, 0);
             else
               ui_pan(ps->ctx, ui, -1.0/25.0); // Fine line down-pan
             break;
 
           case SDLK_k:
             if (SDL_GetModState() & KMOD_SHIFT)
-              ui_pan(ps->ctx, ui, 1.0/5.0);  // Medium up-pan
+              previous_page(ps->ctx, ui, 0);
             else
               ui_pan(ps->ctx, ui, 1.0/25.0);  // Fine line up-pan
+            break;
+
+          case SDLK_d:
+            ui_pan(ps->ctx, ui, -1.0/5.0); // Medium down-pan
+            break;
+
+          case SDLK_u:
+            ui_pan(ps->ctx, ui, 1.0/5.0);  // Medium up-pan
             break;
 
           case SDLK_SPACE:
