@@ -45,6 +45,9 @@ typedef struct
   float zoom;
   enum txp_fit_mode fit;
   fz_point pan;
+  // Vertical offset of the page past the end of its panning range (while
+  // scrolling past it), in pixels
+  float overscroll;
   bool crop, themed_color, invert_color;
   uint32_t background_color, foreground_color;
 } txp_renderer_config;

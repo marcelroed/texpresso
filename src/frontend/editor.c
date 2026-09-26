@@ -308,6 +308,37 @@ bool editor_parse(fz_context *ctx,
                            .path = val_string(ctx, stack, path)},
     };
   }
+  else if (strcmp(verb, "test-wheel") == 0)
+  {
+    if (len != 2 && len != 3)
+      goto arity;
+    val dy = val_array_get(ctx, stack, command, 1);
+    if (!val_is_number(dy))
+      goto arguments;
+    enum txp_scroll_phase phase = TXP_SCROLL_WHEEL;
+    if (len == 3)
+    {
+      static const char *phases[] = {
+          [TXP_SCROLL_WHEEL] = "wheel",     [TXP_SCROLL_TOUCH] = "touch",
+          [TXP_SCROLL_FINGERS] = "fingers", [TXP_SCROLL_RELEASE] = "release",
+          [TXP_SCROLL_MOMENTUM] = "momentum",
+      };
+      val vphase = val_array_get(ctx, stack, command, 2);
+      if (!val_is_string(vphase))
+        goto arguments;
+      const char *name = val_string(ctx, stack, vphase);
+      int i = 0, n = sizeof(phases) / sizeof(phases[0]);
+      while (i < n && strcmp(name, phases[i]) != 0)
+        i += 1;
+      if (i == n)
+        goto arguments;
+      phase = i;
+    }
+    *out = (struct editor_command){
+        .tag = EDIT_TEST_WHEEL,
+        .test_wheel = {.dy = val_number(ctx, dy), .phase = phase},
+    };
+  }
   else if (strcmp(verb, "crop") == 0)
   {
     if (len != 1)

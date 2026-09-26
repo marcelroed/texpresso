@@ -3,6 +3,7 @@
 
 #include "driver.h"
 #include "vstack.h"
+#include "scroll.h"
 
 void editor_set_protocol(enum editor_protocol protocol);
 void editor_set_line_output(bool line);
@@ -39,6 +40,7 @@ enum EDITOR_COMMAND
   EDIT_RERUN_ONCE,
   EDIT_TEST_CLICK,
   EDIT_TEST_PAGE_TEXT,
+  EDIT_TEST_WHEEL,
 };
 
 struct editor_change
@@ -151,6 +153,12 @@ struct editor_command
       int page;
       const char *path;
     } test_page_text;
+
+    // Testing: vertical scrolling by wheel units
+    struct {
+      float dy;
+      enum txp_scroll_phase phase;
+    } test_wheel;
   };
 };
 

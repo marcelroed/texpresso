@@ -40,6 +40,7 @@
 #include "prot_parser.h"
 #include "editor.h"
 #include "base64.h"
+#include "scroll.h"
 
 struct persistent_state *pstate;
 
@@ -51,6 +52,11 @@ static void schedule_event(enum custom_events ev)
 static bool should_reload_binary(void)
 {
   return pstate->should_reload_binary();
+}
+
+static void scroll_wakeup(void)
+{
+  schedule_event(SCROLL_EVENT);
 }
 
 #ifdef __APPLE__
@@ -124,8 +130,22 @@ typedef struct {
     fz_point pt;
     fz_rect box; // typeset line holding pt, empty if unknown
     bool no_caret; // pt is unreliable, only highlight box
-    uint32_t ticks, last_frame;
+    uint32_t ticks;
   } sync_mark;
+
+  // Scrolling past the ends of the page (see ui_wheel_pan_y)
+  struct {
+    float tension;       // scrolled past the top (> 0) or the bottom (< 0), in pixels
+    float velocity;      // of the spring, in pixels per millisecond
+    uint32_t last_wheel; // time of the last wheel event without phases
+    double last_scroll;  // time of the last event with phases (txp_scroll_event)
+    bool touching;       // the fingers are on the trackpad
+    bool scrolled;       // the current wheel gesture moved the page
+    bool flipped;        // the current gesture turned the page
+    bool bounced;        // the momentum reached the end of the page
+  } overscroll;
+
+  uint32_t last_frame; // time of the last rendering
 
   // Last forward sync request (the path relative to the document).
   struct {
@@ -161,6 +181,33 @@ static bool sync_mark_active(ui_state *ui)
   return ui->sync_mark.active;
 }
 
+// Scrolling past the top or the bottom of the page stretches a spring, and
+// stretching it OVERSCROLL_FLIP points turns to the previous or the next
+// page, which comes in from the side of the old one. The spring holds while
+// the fingers are on the trackpad, and goes back once they leave. The
+// momentum of the scroll does not stretch it: the page bounces at the end,
+// and the rest of the momentum is dropped.
+// Mouse wheels (and the SDL events on other systems) have no phases: a
+// gesture ends WHEEL_GESTURE_GAP_MS after its last event, only one that starts
+// at the end of the page stretches the spring, and OVERSCROLL_FLIP_WHEEL
+// points turn the page.
+#define OVERSCROLL_FLIP 360
+#define OVERSCROLL_FLIP_WHEEL 120
+#define OVERSCROLL_STRETCH 80 // points the page can move at most
+#define OVERSCROLL_SPRING_MS 45 // time constant of the (critically damped) spring
+#define OVERSCROLL_FRAME_MS 16
+#define WHEEL_GESTURE_GAP_MS 150
+
+// Milliseconds between the frames of the running animations, 0 if none
+static uint32_t animation_frame_ms(ui_state *ui)
+{
+  if (ui->overscroll.tension != 0 || ui->overscroll.velocity != 0)
+    return OVERSCROLL_FRAME_MS;
+  if (sync_mark_active(ui))
+    return SYNC_MARK_FRAME_MS;
+  return 0;
+}
+
 /* UI rendering */
 
 static float zoom_factor(int count)
@@ -172,11 +219,10 @@ static fz_point get_scale_factor(SDL_Window *window);
 
 static void render_sync_mark(fz_context *ctx, ui_state *ui)
 {
-  ui->sync_mark.last_frame = SDL_GetTicks();
   if (!sync_mark_active(ui) || ui->sync_mark.page != ui->page)
     return;
 
-  uint32_t elapsed = ui->sync_mark.last_frame - ui->sync_mark.ticks;
+  uint32_t elapsed = ui->last_frame - ui->sync_mark.ticks;
   float strength = 1.0;
   if (elapsed > SYNC_MARK_HOLD_MS)
     strength = 1.0 - (float)(elapsed - SYNC_MARK_HOLD_MS) / SYNC_MARK_FADE_MS;
@@ -2314,8 +2360,39 @@ static bool sync_backward_by_text(struct persistent_state *ps, ui_state *ui,
   return found;
 }
 
+// Move the spring back to rest when the gesture no longer holds it (right
+// after turning the page, the new page comes in from the side of the old
+// one), and move the page
+static void overscroll_step(fz_context *ctx, ui_state *ui, uint32_t now)
+{
+  float t = ui->overscroll.tension, v = ui->overscroll.velocity;
+  bool held = !ui->overscroll.flipped &&
+              (ui->overscroll.touching ||
+               now - ui->overscroll.last_wheel <= WHEEL_GESTURE_GAP_MS);
+  if ((t != 0 || v != 0) && !held)
+  {
+    // No frames while nothing moves: do not jump after a pause
+    float dt = fminf(now - ui->last_frame, 2 * OVERSCROLL_FRAME_MS);
+    // Critically damped: back as fast as it can without oscillating
+    float w = 1.0f / OVERSCROLL_SPRING_MS, a = v + w * t, e = expf(-w * dt);
+    t = (t + a * dt) * e;
+    v = (v - w * a * dt) * e;
+    if (fabsf(t) < 0.5f && fabsf(v) * OVERSCROLL_FRAME_MS < 0.5f)
+      t = v = 0;
+    ui->overscroll.tension = t;
+    ui->overscroll.velocity = v;
+  }
+  // The page moves less and less, up to OVERSCROLL_STRETCH
+  float s = OVERSCROLL_STRETCH * get_scale_factor(ui->window).y;
+  txp_renderer_get_config(ctx, ui->doc_renderer)->overscroll =
+    s * t / (fabsf(t) + s);
+}
+
 static void render(fz_context *ctx, ui_state *ui)
 {
+  uint32_t now = SDL_GetTicks();
+  overscroll_step(ctx, ui, now);
+  ui->last_frame = now;
   SDL_SetRenderDrawColor(ui->sdl_renderer, 0, 0, 0, 255);
   SDL_RenderClear(ui->sdl_renderer);
   txp_renderer_render(ctx, ui->doc_renderer);
@@ -3100,7 +3177,131 @@ static void ui_mouse_move(fz_context *ctx, ui_state *ui, int x, int y)
 // small precise deltas, so this needs to be fairly large to feel responsive.
 #define WHEEL_PAN_SPEED 20
 
-static void ui_mouse_wheel(fz_context *ctx, ui_state *ui, float dx, float dy, int mousex, int mousey, bool ctrl, int timestamp)
+// SDL_EVENT_PINCH_UPDATE of SDL 3.4 (trackpad pinch). SDL 2 has no pinch
+// events, but sdl2-compat passes this one through, with the SDL 3 payload
+// (the float scale change) after the SDL 2 event header.
+#define SDL3_PINCH_UPDATE 0x711
+
+static void previous_page(fz_context *ctx, ui_state *ui, bool pan);
+static void next_page(fz_context *ctx, ui_state *ui, bool pan);
+
+// Scroll by y pixels (> 0 towards the top of the page), stretching the spring
+// at the ends of the page (see OVERSCROLL_FLIP). dt is the time since the
+// previous scroll event, in milliseconds.
+static void ui_wheel_pan_y(fz_context *ctx, ui_state *ui, float y,
+                           enum txp_scroll_phase phase, float dt)
+{
+  txp_renderer_config *config = txp_renderer_get_config(ctx, ui->doc_renderer);
+  bool wheel = phase == TXP_SCROLL_WHEEL;
+  bool momentum = phase == TXP_SCROLL_MOMENTUM;
+  if (wheel)
+  {
+    uint32_t now = SDL_GetTicks();
+    if (now - ui->overscroll.last_wheel > WHEEL_GESTURE_GAP_MS)
+      ui->overscroll.scrolled = ui->overscroll.flipped = false;
+    ui->overscroll.last_wheel = now;
+    // The gesture holds the spring (unless it turned the page)
+    if (!ui->overscroll.flipped)
+      ui->overscroll.velocity = 0;
+  }
+
+  // The rest of a gesture that turned the page, and the momentum after the
+  // page bounced, are dropped
+  if (ui->overscroll.flipped || (momentum && ui->overscroll.bounced) || y == 0)
+    return;
+
+  txp_renderer_bounds bounds;
+  if (!txp_renderer_page_bounds(ctx, ui->doc_renderer, &bounds))
+  {
+    config->pan.y += y;
+    return;
+  }
+
+  // Scrolling back releases the spring first
+  float t = ui->overscroll.tension;
+  if (t != 0 && (t > 0) != (y > 0))
+  {
+    if (fabsf(y) < fabsf(t))
+    {
+      ui->overscroll.tension = t + y;
+      return;
+    }
+    y += t;
+    t = 0;
+  }
+
+  float range = fmaxf(bounds.pan_interval.y, 0);
+  float pan = fz_clamp(config->pan.y, -range, range);
+  float moved = fz_clamp(pan + y, -range, range);
+  if (moved != pan)
+    ui->overscroll.scrolled = true;
+  config->pan.y = moved;
+  float excess = pan + y - moved;
+  if (momentum)
+  {
+    // The page bounces at the end, at the speed of the scroll
+    if (excess != 0)
+    {
+      ui->overscroll.velocity += y / dt;
+      ui->overscroll.bounced = true;
+    }
+  }
+  else if (!wheel || !ui->overscroll.scrolled)
+    t += excess;
+  ui->overscroll.tension = t;
+
+  float flip = (wheel ? OVERSCROLL_FLIP_WHEEL : OVERSCROLL_FLIP) *
+               get_scale_factor(ui->window).y;
+  if (momentum || fabsf(t) < flip)
+    return;
+  bool last = send(get_status, ui->eng) == DOC_TERMINATED &&
+              ui->page + 1 >= send(page_count, ui->eng);
+  if (t > 0 ? ui->page == 0 : last)
+  {
+    // No page to turn to
+    ui->overscroll.tension = t > 0 ? flip : -flip;
+    return;
+  }
+  if (t > 0)
+    previous_page(ctx, ui, true);
+  else
+    next_page(ctx, ui, true);
+  ui->overscroll.tension = t > 0 ? -flip : flip;
+  ui->overscroll.velocity = 0;
+  ui->overscroll.flipped = true;
+}
+
+// Change the zoom level by delta (see zoom_factor), keeping the point under
+// the mouse in place
+static void ui_zoom_at(fz_context *ctx, ui_state *ui, float delta, int mousex, int mousey)
+{
+  SDL_FRect rect;
+  if (delta == 0 || !txp_renderer_page_position(ctx, ui->doc_renderer, &rect, NULL, NULL))
+    return;
+
+  fz_point scale = get_scale_factor(ui->window);
+  txp_renderer_config *config = txp_renderer_get_config(ctx, ui->doc_renderer);
+  ui->zoom = fz_maxi(ui->zoom + delta, 0);
+  int ww, wh;
+  SDL_GetWindowSize(ui->window, &ww, &wh);
+  float mx = (mousex - ww / 2.0f) * scale.x;
+  float my = (mousey - wh / 2.0f) * scale.y;
+  float of = config->zoom, nf = zoom_factor(ui->zoom);
+  config->pan.x = mx + nf * ((config->pan.x - mx) / of);
+  config->pan.y = my + nf * ((config->pan.y - my) / of);
+  config->zoom = nf;
+  schedule_event(RENDER_EVENT);
+}
+
+// Trackpad pinch: factor is the scale change since the previous update
+static void ui_pinch(fz_context *ctx, ui_state *ui, float factor, int mousex, int mousey)
+{
+  if (ui->mouse_status != UI_MOUSE_NONE || !(factor > 0))
+    return;
+  ui_zoom_at(ctx, ui, roundf(5000.0f * logf(factor)), mousex, mousey);
+}
+
+static void ui_mouse_wheel(fz_context *ctx, ui_state *ui, float dx, float dy, int mousex, int mousey, bool ctrl, enum txp_scroll_phase phase, float dt)
 {
   fz_point scale = get_scale_factor(ui->window);
 
@@ -3110,30 +3311,43 @@ static void ui_mouse_wheel(fz_context *ctx, ui_state *ui, float dx, float dy, in
   txp_renderer_config *config = txp_renderer_get_config(ctx, ui->doc_renderer);
 
   if (ctrl)
-  {
-    SDL_FRect rect;
-    if (dy != 0 && txp_renderer_page_position(ctx, ui->doc_renderer, &rect, NULL, NULL))
-    {
-      ui->zoom = fz_maxi(ui->zoom + dy * 100, 0);
-      int ww, wh;
-      SDL_GetWindowSize(ui->window, &ww, &wh);
-      float mx = (mousex - ww / 2.0f) * scale.x;
-      float my = (mousey - wh / 2.0f) * scale.y;
-      float of = config->zoom, nf = zoom_factor(ui->zoom);
-      config->pan.x = mx + nf * ((config->pan.x - mx) / of);
-      config->pan.y = my + nf * ((config->pan.y - my) / of);
-      config->zoom = nf;
-      schedule_event(RENDER_EVENT);
-    }
-  }
+    ui_zoom_at(ctx, ui, dy * 100, mousex, mousey);
   else
   {
-    (void)timestamp;
     float x = scale.x * dx * WHEEL_PAN_SPEED;
     float y = scale.y * dy * WHEEL_PAN_SPEED;
     config->pan.x -= x;
-    config->pan.y += y;
+    ui_wheel_pan_y(ctx, ui, y, phase, dt);
     // fprintf(stderr, "wheel pan: (%.02f, %.02f) raw:(%.02f, %.02f)\n", x, y, dx, dy);
+    schedule_event(RENDER_EVENT);
+  }
+}
+
+// A scroll event with the phases of the gesture (see scroll.h)
+static void ui_scroll(fz_context *ctx, ui_state *ui, const txp_scroll_event *ev)
+{
+  if (ev->phase == TXP_SCROLL_TOUCH)
+  {
+    // A new gesture: the fingers hold the spring where it is
+    ui->overscroll.flipped = ui->overscroll.bounced = false;
+    ui->overscroll.velocity = 0;
+  }
+  if (ev->phase == TXP_SCROLL_TOUCH || ev->phase == TXP_SCROLL_FINGERS)
+    ui->overscroll.touching = true;
+
+  float dt = fz_clamp(ev->ms - ui->overscroll.last_scroll, 4, 50);
+  ui->overscroll.last_scroll = ev->ms;
+  if (ev->dx != 0 || ev->dy != 0)
+  {
+    int mx = 0, my = 0;
+    mouse_position_in_points(&mx, &my);
+    bool ctrl = !!(SDL_GetModState() & KMOD_CTRL);
+    ui_mouse_wheel(ctx, ui, ev->dx, ev->dy, mx, my, ctrl, ev->phase, dt);
+  }
+
+  if (ev->phase == TXP_SCROLL_RELEASE)
+  {
+    ui->overscroll.touching = false;
     schedule_event(RENDER_EVENT);
   }
 }
@@ -3932,6 +4146,28 @@ static void interpret_command(struct persistent_state *ps,
     }
     break;
 
+    case EDIT_TEST_WHEEL:
+    {
+      txp_scroll_event ev = {
+          .phase = cmd.test_wheel.phase,
+          .dy = cmd.test_wheel.dy,
+          .ms = SDL_GetTicks(),
+      };
+      if (ev.phase == TXP_SCROLL_WHEEL)
+        ui_mouse_wheel(ps->ctx, ui, 0, ev.dy, 0, 0, false, ev.phase,
+                       OVERSCROLL_FRAME_MS);
+      else
+        ui_scroll(ps->ctx, ui, &ev);
+      txp_renderer_config *config =
+        txp_renderer_get_config(ps->ctx, ui->doc_renderer);
+      fprintf(stderr, "[test] wheel: page %d pan %.2f tension %.2f velocity %.2f%s%s\n",
+              ui->page, config->pan.y, ui->overscroll.tension,
+              ui->overscroll.velocity,
+              ui->overscroll.flipped ? " flipped" : "",
+              ui->overscroll.bounced ? " bounced" : "");
+    }
+    break;
+
     case EDIT_SYNCTEX_FORWARD:
     {
       fz_buffer *buf;
@@ -4134,6 +4370,13 @@ bool texpresso_main(struct persistent_state *ps)
   ui->last_mouse_x = -1000;
   ui->last_mouse_y = -1000;
   ui->last_click_ticks = SDL_GetTicks() - 200000000;
+  ui->overscroll.tension = ui->overscroll.velocity = 0;
+  ui->overscroll.last_wheel = SDL_GetTicks() - 200000000;
+  ui->overscroll.last_scroll = 0;
+  ui->overscroll.touching = ui->overscroll.scrolled = false;
+  ui->overscroll.flipped = ui->overscroll.bounced = false;
+  ui->last_frame = SDL_GetTicks();
+  txp_renderer_get_config(ps->ctx, ui->doc_renderer)->overscroll = 0;
 
   bool quit = 0, reload = 0;
   if (!ps->paused)
@@ -4143,6 +4386,7 @@ bool texpresso_main(struct persistent_state *ps)
 
   struct repaint_on_resize_env repaint_on_resize_env = {.ctx = ps->ctx, .ui = ui};
   SDL_AddEventWatch(repaint_on_resize, &repaint_on_resize_env);
+  txp_scroll_start(scroll_wakeup);
 
   vstack *cmd_stack = vstack_new(ps->ctx);
   prot_parser cmd_parser;
@@ -4246,28 +4490,33 @@ bool texpresso_main(struct persistent_state *ps)
 
       if (!has_event)
       {
+        uint32_t frame_ms = animation_frame_ms(ui);
+        uint32_t since = SDL_GetTicks() - ui->last_frame;
+        bool animating = frame_ms != 0;
         if (advance)
+        {
+          // Keep animations going while the engine works (on a page that
+          // was just turned to)
+          if (animating && since >= frame_ms)
+            render(ps->ctx, ui);
           continue;
+        }
         if (!stdin_eof)
           wakeup_poll_thread(poll_stdin_pipe, 'c');
 
         bool rerun_eligible = ps->rerun_enabled
                               && rerun_count < MAX_RERUNS
                               && aux_ready;
-        bool animating = sync_mark_active(ui);
         if (animating)
-        {
-          uint32_t since = SDL_GetTicks() - ui->sync_mark.last_frame;
           has_event = SDL_WaitEventTimeout(
-              &e, since >= SYNC_MARK_FRAME_MS ? 1 : SYNC_MARK_FRAME_MS - since);
-        }
+              &e, since >= frame_ms ? 1 : frame_ms - since);
         else if (rerun_eligible)
           has_event = SDL_WaitEventTimeout(&e, T_IDLE_MS);
         else
           has_event = SDL_WaitEvent(&e);
         if (!has_event && animating)
         {
-          // Next frame of the sync marker fade-out.
+          // Next frame of the animations
           render(ps->ctx, ui);
           continue;
         }
@@ -4616,9 +4865,20 @@ bool texpresso_main(struct persistent_state *ps)
           py = e.wheel.y;
 #endif
           bool ctrl = !!(SDL_GetModState() & KMOD_CTRL);
-          ui_mouse_wheel(ps->ctx, ui, px, py, mx, my, ctrl, e.wheel.timestamp);
+          ui_mouse_wheel(ps->ctx, ui, px, py, mx, my, ctrl, TXP_SCROLL_WHEEL,
+                         OVERSCROLL_FRAME_MS);
         }
         break;
+
+      case SDL3_PINCH_UPDATE:
+      {
+        float factor;
+        memcpy(&factor, (char *)&e + sizeof(SDL_CommonEvent), sizeof(factor));
+        int mx = 0, my = 0;
+        mouse_position_in_points(&mx, &my);
+        ui_pinch(ps->ctx, ui, factor, mx, my);
+        break;
+      }
 
       case SDL_MOUSEBUTTONDOWN:
       {
@@ -4693,8 +4953,12 @@ bool texpresso_main(struct persistent_state *ps)
           if (ui->page >= page_count &&
               send(get_status, ui->eng) == DOC_TERMINATED)
           {
+            // Past the end of the document: at the end of the last page
             if (page_count > 0)
+            {
               ui->page = page_count - 1;
+              pan_to(ps->ctx, ui, PAN_TO_BOTTOM);
+            }
           }
           if (ui->page < page_count)
             display_page(ps, ui);
@@ -4702,6 +4966,14 @@ bool texpresso_main(struct persistent_state *ps)
 
         case STDIN_EVENT:
           break;
+
+        case SCROLL_EVENT:
+        {
+          txp_scroll_event ev;
+          while (txp_scroll_next(&ev))
+            ui_scroll(ps->ctx, ui, &ev);
+          break;
+        }
       }
     }
     if (ps->initialize_only &&
@@ -4723,6 +4995,7 @@ bool texpresso_main(struct persistent_state *ps)
   }
 
   SDL_DelEventWatch(repaint_on_resize, &repaint_on_resize_env);
+  txp_scroll_stop();
 
   if (ps->initial.initialized && ps->initial.display_list)
     fz_drop_display_list(ps->ctx, ps->initial.display_list);

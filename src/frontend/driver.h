@@ -35,6 +35,7 @@ enum custom_events {
   RENDER_EVENT,
   RELOAD_EVENT,
   STDIN_EVENT,
+  SCROLL_EVENT,
 
   EVENT_COUNT,
 };

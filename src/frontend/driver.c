@@ -288,6 +288,11 @@ int main(int argc, const char **argv)
 
   bool init = 0;
 
+  // Trackpad scrolling keeps its momentum after the fingers lift, and stops
+  // when they touch again, as in other macOS applications. SDL 3 (under
+  // sdl2-compat) turns momentum off unless this hint is set before SDL_Init.
+  SDL_SetHint("SDL_MAC_SCROLL_MOMENTUM", "1");
+
   //Initialize SDL
   if (init == 0 && SDL_Init(SDL_INIT_VIDEO) < 0)
   {

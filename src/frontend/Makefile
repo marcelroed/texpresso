@@ -1,5 +1,11 @@
 OBJECTS=sprotocol.o state.o fs.o incdvi.o myabort.o renderer.o engine_tex.o engine_pdf.o engine_dvi.o synctex.o prot_parser.o sexp_parser.o json_parser.o editor.o
 
+ifeq ($(shell uname), Darwin)
+# The phases of trackpad gestures (see scroll.h)
+OBJECTS+=scroll_macos.o
+PLATFORM_LIBS=-framework AppKit
+endif
+
 BUILD=../../build
 DIR=$(BUILD)/frontend
 
@@ -39,6 +45,9 @@ re2c:
 $(DIR)/%.o: %.c | $(DIR)
 	$(CC) -c -o $@ -I../dvi/ -I../include $<
 
+$(DIR)/%.o: %.m | $(DIR)
+	$(CC) -fobjc-arc -c -o $@ $<
+
 $(DIR)/libmydvi.a:
 	$(MAKE) -C ../dvi $(DIR)/libmydvi.a
 
@@ -53,5 +62,6 @@ $(DIR):
 	$(MAKE) -C ../.. config
 
 include ../../Makefile.config
+LIBS+=$(PLATFORM_LIBS)
 
 .PHONY: all clean $(TARGETS) re2c $(DIR)/libmydvi.a

@@ -264,7 +264,7 @@ bool txp_renderer_page_position(fz_context *ctx, txp_renderer *self, SDL_FRect *
 
   float scale = bounds.document_size.x / (bounds.page_bounds.x1 - bounds.page_bounds.x0);
   float tx = self->config.pan.x - cx;
-  float ty = self->config.pan.y - cy;
+  float ty = self->config.pan.y - cy + self->config.overscroll;
 
   if (prect)
     *prect = (SDL_FRect){.x = tx, .y = ty, .w = bounds.document_size.x, .h = bounds.document_size.y};

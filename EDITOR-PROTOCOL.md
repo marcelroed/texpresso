@@ -172,9 +172,10 @@ The optional `column` (0-based, the number of characters before the cursor on th
 ```scheme
 (test-click page x y)
 (test-page-text page "path")
+(test-wheel dy [phase])
 ```
 
-For tests (see [test/synctex-check.py](test/synctex-check.py)). `test-click` displays `page` (0-based) and runs backward synchronisation at `(x, y)` in document units (points from the top left corner of the page), as a click there would; the `synctex` message, if any, is followed by the line `[test] click done` on stderr. `test-page-text` writes the text of `page` to the file at "path", as a JSON array of lines `{"bbox": [x0, y0, x1, y1], "chars": [[code, x0, y0, x1, y1, origin_x, origin_y], ...]}`, then prints `[test] page text written` on stderr. Both print `[test] page N is not available` instead when the page does not exist.
+For tests (see [test/synctex-check.py](test/synctex-check.py)). `test-click` displays `page` (0-based) and runs backward synchronisation at `(x, y)` in document units (points from the top left corner of the page), as a click there would; the `synctex` message, if any, is followed by the line `[test] click done` on stderr. `test-page-text` writes the text of `page` to the file at "path", as a JSON array of lines `{"bbox": [x0, y0, x1, y1], "chars": [[code, x0, y0, x1, y1, origin_x, origin_y], ...]}`, then prints `[test] page text written` on stderr. Both print `[test] page N is not available` instead when the page does not exist. `test-wheel` scrolls as a vertical scroll event of `dy` units would (positive towards the top of the page) and prints `[test] wheel: page P pan Y tension T velocity V` on stderr, followed by `flipped` when the current gesture turned the page and `bounced` when its momentum reached the end of the page: scrolling past the top or the bottom of the page stretches a spring (`tension`, in pixels, moving at `velocity` pixels per millisecond) and turns to the previous or the next page when it is stretched far enough. The optional `phase` is the phase of the trackpad gesture the event belongs to, as macOS reports it: `"touch"` (the fingers touched the trackpad), `"fingers"` (they move), `"release"` (they left), `"momentum"` (the scroll continues after they left), or `"wheel"` (the default, a mouse wheel without phases).
 
 ## Messages (texpresso -> editor)
 
