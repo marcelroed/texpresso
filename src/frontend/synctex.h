@@ -53,8 +53,6 @@ bool synctex_scan(fz_context *ctx, synctex_t *stx, fz_buffer *buf,
 int synctex_has_target(synctex_t *stx);
 // column is 0-based (characters before the cursor), or -1 if unknown.
 void synctex_set_target(synctex_t *stx, int current_page, const char *path, int line, int column);
-// On a hit, *box receives the typeset line holding the position (empty
-// rectangle if unknown), in the same units as *x and *y.
 // How precise the last candidate found by synctex_find_target is: 0, or
 // SYNCTEX_IMPRECISE when it locates the target line only coarsely (no record
 // of the line, or no usable column), plus SYNCTEX_FLOATING when its
@@ -65,6 +63,10 @@ void synctex_set_target(synctex_t *stx, int current_page, const char *path, int 
 #define SYNCTEX_FLOATING 2
 #define SYNCTEX_OTHER_LINE 4
 int synctex_candidate_imprecise(synctex_t *stx);
-int synctex_find_target(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int *page, int *x, int *y, fz_irect *box);
+// Forward search, as the pages of the document come in. On a hit, *box
+// receives the typeset line holding the position (empty rectangle if unknown),
+// in the same units as *x and *y. complete: no more pages will come, the
+// search ends with the pages there are.
+int synctex_find_target(fz_context *ctx, synctex_t *stx, fz_buffer *buf, bool complete, int *page, int *x, int *y, fz_irect *box);
 
 #endif // SYNCTEX_H_

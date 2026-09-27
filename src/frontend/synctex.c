@@ -179,6 +179,8 @@ struct synctex_s
   /* Whether the candidate only locates the target line coarsely: no record
      of the line exists, or its records carry no usable column. */
   int candidate_imprecise;
+  /* The candidate changed since synctex_find_target last returned it. */
+  int candidate_pending;
 };
 
 synctex_t *synctex_new(fz_context *ctx)
@@ -242,8 +244,14 @@ void synctex_rollback(fz_context *ctx, synctex_t *stx, size_t offset)
       int pages = stx->page_off.len / 2;
       if (stx->scanned_pages > pages)
         stx->scanned_pages = pages;
-      if (stx->candidate_page > pages)
+      if (stx->candidate_page >= pages)
+      {
         stx->candidate_page = -1;
+        stx->candidate_open = 0;
+        stx->candidate_key = INT_MAX;
+        stx->candidate_imprecise = 0;
+        stx->candidate_pending = 0;
+      }
     }
   }
 }
@@ -858,6 +866,7 @@ static bool synctex_find_input(fz_context *ctx, synctex_t *stx, fz_buffer *buf)
     stx->candidate_open = 0;
     stx->candidate_key = INT_MAX;
     stx->candidate_imprecise = 0;
+    stx->candidate_pending = 0;
     return 1;
   }
 
@@ -1261,7 +1270,7 @@ int synctex_candidate_imprecise(synctex_t *stx)
   return stx->candidate_imprecise;
 }
 
-int synctex_find_target(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int *page, int *x, int *y, fz_irect *box)
+int synctex_find_target(fz_context *ctx, synctex_t *stx, fz_buffer *buf, bool complete, int *page, int *x, int *y, fz_irect *box)
 {
   if (!stx || !stx->target_path[0])
     return 0;
@@ -1276,16 +1285,11 @@ int synctex_find_target(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int *pa
     synctex_backscan_page(ctx, stx, buf, stx->scanned_pages, &updated_candidate);
     stx->scanned_pages += 1;
   }
-
   if (updated_candidate)
-  {
-    if (page) *page = stx->candidate_page;
-    if (x) *x = stx->candidate_x;
-    if (y) *y = stx->candidate_y;
-    if (box) *box = stx->candidate_box;
-  }
+    stx->candidate_pending = 1;
 
-  if (synctex_input_closed(ctx, stx, stx->input_tag))
+  if (stx->target_path[0] &&
+      (complete || synctex_input_closed(ctx, stx, stx->input_tag)))
   {
     // The target file is fully typeset: the search is over. Tell tests that
     // wait for an answer when there is none.
@@ -1294,5 +1298,18 @@ int synctex_find_target(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int *pa
     synctex_clear_search(stx);
   }
 
-  return updated_candidate;
+  // While the search goes on, a candidate from another line, or one whose
+  // column search is open, waits for the next page, which can hold a better
+  // one: after an edit, the pages are typeset again one by one, and the
+  // viewer would show the page before the target for a moment.
+  if (!stx->candidate_pending ||
+      (stx->target_path[0] && stx->candidate_page + 1 >= stx->scanned_pages))
+    return 0;
+
+  stx->candidate_pending = 0;
+  if (page) *page = stx->candidate_page;
+  if (x) *x = stx->candidate_x;
+  if (y) *y = stx->candidate_y;
+  if (box) *box = stx->candidate_box;
+  return 1;
 }

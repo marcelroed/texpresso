@@ -4555,7 +4555,8 @@ bool texpresso_main(struct persistent_state *ps)
       synctex_t *stx = send(synctex, ui->eng, &buf);
       int page = -1, x = -1, y = -1;
       fz_irect box = fz_empty_irect;
-      if (synctex_find_target(ps->ctx, stx, buf, &page, &x, &y, &box))
+      bool complete = send(get_status, ui->eng) == DOC_TERMINATED;
+      if (synctex_find_target(ps->ctx, stx, buf, complete, &page, &x, &y, &box))
       {
         fprintf(stderr, "[synctex forward] sync: hit page %d, coordinates (%d, %d), "
                 "line box (%d, %d)-(%d, %d)\n",
