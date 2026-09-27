@@ -114,7 +114,6 @@ typedef struct {
 
   int page;
   int need_synctex;
-  int zoom;
 
   // Mouse input state
   int last_mouse_x, last_mouse_y;
@@ -3271,22 +3270,25 @@ static void ui_wheel_pan_y(fz_context *ctx, ui_state *ui, float y,
   ui->overscroll.flipped = true;
 }
 
-// Change the zoom level by delta (see zoom_factor), keeping the point under
-// the mouse in place
-static void ui_zoom_at(fz_context *ctx, ui_state *ui, float delta, int mousex, int mousey)
+// Pinch and Ctrl+wheel do not zoom out further (at 1 the page fits the window)
+#define POINTER_ZOOM_MIN 0.1f
+
+// Multiply the zoom by factor, keeping the point under the mouse in place
+static void ui_zoom_at(fz_context *ctx, ui_state *ui, float factor, int mousex, int mousey)
 {
   SDL_FRect rect;
-  if (delta == 0 || !txp_renderer_page_position(ctx, ui->doc_renderer, &rect, NULL, NULL))
+  if (factor == 1 || !(factor > 0) ||
+      !txp_renderer_page_position(ctx, ui->doc_renderer, &rect, NULL, NULL))
     return;
 
   fz_point scale = get_scale_factor(ui->window);
   txp_renderer_config *config = txp_renderer_get_config(ctx, ui->doc_renderer);
-  ui->zoom = fz_maxi(ui->zoom + delta, 0);
   int ww, wh;
   SDL_GetWindowSize(ui->window, &ww, &wh);
   float mx = (mousex - ww / 2.0f) * scale.x;
   float my = (mousey - wh / 2.0f) * scale.y;
-  float of = config->zoom, nf = zoom_factor(ui->zoom);
+  float of = config->zoom;
+  float nf = fmaxf(of * factor, fminf(of, POINTER_ZOOM_MIN));
   config->pan.x = mx + nf * ((config->pan.x - mx) / of);
   config->pan.y = my + nf * ((config->pan.y - my) / of);
   config->zoom = nf;
@@ -3296,9 +3298,9 @@ static void ui_zoom_at(fz_context *ctx, ui_state *ui, float delta, int mousex, i
 // Trackpad pinch: factor is the scale change since the previous update
 static void ui_pinch(fz_context *ctx, ui_state *ui, float factor, int mousex, int mousey)
 {
-  if (ui->mouse_status != UI_MOUSE_NONE || !(factor > 0))
+  if (ui->mouse_status != UI_MOUSE_NONE)
     return;
-  ui_zoom_at(ctx, ui, roundf(5000.0f * logf(factor)), mousex, mousey);
+  ui_zoom_at(ctx, ui, factor, mousex, mousey);
 }
 
 static void ui_mouse_wheel(fz_context *ctx, ui_state *ui, float dx, float dy, int mousex, int mousey, bool ctrl, enum txp_scroll_phase phase, float dt)
@@ -3311,7 +3313,7 @@ static void ui_mouse_wheel(fz_context *ctx, ui_state *ui, float dx, float dy, in
   txp_renderer_config *config = txp_renderer_get_config(ctx, ui->doc_renderer);
 
   if (ctrl)
-    ui_zoom_at(ctx, ui, dy * 100, mousex, mousey);
+    ui_zoom_at(ctx, ui, zoom_factor(dy * 100), mousex, mousey);
   else
   {
     float x = scale.x * dx * WHEEL_PAN_SPEED;
@@ -4352,7 +4354,6 @@ bool texpresso_main(struct persistent_state *ps)
   if (ps->initial.initialized)
   {
     ui->page = ps->initial.page;
-    ui->zoom = ps->initial.zoom;
     ui->need_synctex = ps->initial.need_synctex;
     *txp_renderer_get_config(ps->ctx, ui->doc_renderer) = ps->initial.config;
     txp_renderer_set_contents(ps->ctx, ui->doc_renderer,
@@ -4362,7 +4363,6 @@ bool texpresso_main(struct persistent_state *ps)
   else
   {
     ui->page = 0;
-    ui->zoom = 0;
     ui->need_synctex = 1;
   }
 
@@ -5010,7 +5010,6 @@ bool texpresso_main(struct persistent_state *ps)
   ps->initial.initialized = 1;
   ps->initial.page = ui->page;
   ps->initial.need_synctex = ui->need_synctex;
-  ps->initial.zoom = ui->zoom;
   ps->initial.config = *txp_renderer_get_config(ps->ctx, ui->doc_renderer);
   ps->initial.display_list = txp_renderer_get_contents(ps->ctx, ui->doc_renderer);
   if (ps->initial.display_list)
