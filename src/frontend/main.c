@@ -3295,6 +3295,21 @@ static void ui_zoom_at(fz_context *ctx, ui_state *ui, float factor, int mousex, 
   schedule_event(RENDER_EVENT);
 }
 
+// Fit the width of the page to the window, as when the document opens,
+// keeping the middle of the window on the same line
+static void ui_zoom_reset(fz_context *ctx, ui_state *ui)
+{
+  txp_renderer_config *config = txp_renderer_get_config(ctx, ui->doc_renderer);
+  txp_renderer_bounds before, after;
+  bool known = txp_renderer_page_bounds(ctx, ui->doc_renderer, &before);
+  config->fit = FIT_WIDTH;
+  config->zoom = 1;
+  config->pan.x = 0;
+  if (known && txp_renderer_page_bounds(ctx, ui->doc_renderer, &after))
+    config->pan.y *= after.document_size.y / before.document_size.y;
+  schedule_event(RENDER_EVENT);
+}
+
 // Trackpad pinch: factor is the scale change since the previous update
 static void ui_pinch(fz_context *ctx, ui_state *ui, float factor, int mousex, int mousey)
 {
@@ -4744,6 +4759,11 @@ bool texpresso_main(struct persistent_state *ps)
           case SDLK_KP_MINUS:
             config->zoom /= 1.1;
             schedule_event(RENDER_EVENT);
+            break;
+
+          case SDLK_0:
+          case SDLK_KP_0:
+            ui_zoom_reset(ps->ctx, ui);
             break;
 
           case SDLK_h:
