@@ -90,6 +90,9 @@ bool txp_renderer_select_char(fz_context *ctx, txp_renderer *self, fz_point pt);
 void txp_renderer_screen_size(fz_context *ctx, txp_renderer *self, int *w, int *h);
 fz_point txp_renderer_screen_to_document(fz_context *ctx, txp_renderer *self, fz_point pt);
 fz_point txp_renderer_document_to_screen(fz_context *ctx, txp_renderer *self, fz_point pt);
+// Draw a caret like that of an empty selection at x, from y0 to y1
+// (document coordinates), in the current draw color.
+void txp_renderer_draw_caret(fz_context *ctx, txp_renderer *self, float x, float y0, float y1);
 
 // Fold a character for text matching (lower case, no accents), or 0 when it
 // does not take part (punctuation, spaces).

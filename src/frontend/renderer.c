@@ -740,6 +740,18 @@ static void render_caret(txp_renderer *self, int x, int y, int h)
   SDL_RenderFillRect(self->sdl, &r);
 }
 
+void txp_renderer_draw_caret(fz_context *ctx, txp_renderer *self, float x, float y0, float y1)
+{
+  SDL_FRect page_rect;
+  float scale;
+  if (!txp_renderer_page_position(ctx, self, &page_rect, NULL, &scale))
+    return;
+  // Same rounding as the caret of the selection in txp_renderer_render
+  fz_rect bounds = get_bounds(ctx, self);
+  render_caret(self, page_rect.x + (x - bounds.x0) * scale,
+               page_rect.y + (y0 - bounds.y0) * scale, (y1 - y0) * scale);
+}
+
 
 void txp_renderer_render(fz_context *ctx, txp_renderer *self)
 {

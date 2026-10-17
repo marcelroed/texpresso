@@ -129,6 +129,10 @@ typedef struct {
     fz_point pt;
     fz_rect box; // typeset line holding pt, empty if unknown
     bool no_caret; // pt is unreliable, only highlight box
+    // Vertical extent of the caret: that of the character at pt, like the
+    // caret of a selection (looked up when first drawn)
+    bool caret_known;
+    float caret_y0, caret_y1;
     uint32_t ticks;
   } sync_mark;
 
@@ -228,30 +232,15 @@ static void render_sync_mark(fz_context *ctx, ui_state *ui)
   if (strength <= 0)
     return;
 
-  fz_point scale = get_scale_factor(ui->window);
-  fz_point pt = txp_renderer_document_to_screen(ctx, ui->doc_renderer, ui->sync_mark.pt);
-  fz_rect box = ui->sync_mark.box;
-  bool has_box = !fz_is_empty_rect(box);
-  fz_point b0, b1;
-  if (has_box)
-  {
-    b0 = txp_renderer_document_to_screen(ctx, ui->doc_renderer, fz_make_point(box.x0, box.y0));
-    b1 = txp_renderer_document_to_screen(ctx, ui->doc_renderer, fz_make_point(box.x1, box.y1));
-  }
-  else
-  {
-    // No enclosing line box known: draw a caret of a typical line height.
-    b0 = txp_renderer_document_to_screen(ctx, ui->doc_renderer,
-                                         fz_make_point(ui->sync_mark.pt.x, ui->sync_mark.pt.y - 8));
-    b1 = txp_renderer_document_to_screen(ctx, ui->doc_renderer,
-                                         fz_make_point(ui->sync_mark.pt.x, ui->sync_mark.pt.y + 3));
-  }
-
   SDL_SetRenderDrawBlendMode(ui->sdl_renderer, SDL_BLENDMODE_BLEND);
 
-  if (has_box)
+  fz_rect box = ui->sync_mark.box;
+  if (!fz_is_empty_rect(box))
   {
     // Soft band over the whole typeset line.
+    fz_point scale = get_scale_factor(ui->window);
+    fz_point b0 = txp_renderer_document_to_screen(ctx, ui->doc_renderer, fz_make_point(box.x0, box.y0));
+    fz_point b1 = txp_renderer_document_to_screen(ctx, ui->doc_renderer, fz_make_point(box.x1, box.y1));
     SDL_FRect band = {b0.x, b0.y - 1 * scale.y, b1.x - b0.x, b1.y - b0.y + 2 * scale.y};
     SDL_SetRenderDrawColor(ui->sdl_renderer, 255, 170, 0, (Uint8)(48 * strength));
     SDL_RenderFillRectF(ui->sdl_renderer, &band);
@@ -260,16 +249,35 @@ static void render_sync_mark(fz_context *ctx, ui_state *ui)
   if (ui->sync_mark.no_caret)
     return;
 
-  // Caret at the position itself, with a small halo so it stands out on
-  // both light and dark backgrounds.
-  float w = 3 * scale.x;
-  float pad = 2 * scale.y;
-  SDL_FRect halo = {pt.x - w, b0.y - 2 * pad, 3 * w, b1.y - b0.y + 4 * pad};
-  SDL_SetRenderDrawColor(ui->sdl_renderer, 255, 120, 0, (Uint8)(70 * strength));
-  SDL_RenderFillRectF(ui->sdl_renderer, &halo);
-  SDL_FRect caret = {pt.x - w / 2, b0.y - pad, w, b1.y - b0.y + 2 * pad};
+  // Caret at the position itself, of the size of that of a selection: the
+  // height of the character there (the one starting at pt, rather than the
+  // one ending there).
+  fz_point pt = ui->sync_mark.pt;
+  float y0 = pt.y - 8, y1 = pt.y + 3;
+  if (ui->sync_mark.caret_known)
+  {
+    y0 = ui->sync_mark.caret_y0;
+    y1 = ui->sync_mark.caret_y1;
+  }
+  else
+  {
+    fz_rect ch, line;
+    if (txp_renderer_nearest_char(ctx, ui->doc_renderer, fz_make_point(pt.x + 0.5, pt.y),
+                                  &ch, &line, NULL))
+    {
+      // Away from text, keep a caret of a typical line height.
+      if (pt.y >= ch.y0 && pt.y <= ch.y1 && pt.x >= ch.x0 - 12 && pt.x <= ch.x1 + 12)
+      {
+        y0 = ch.y0;
+        y1 = ch.y1;
+      }
+      ui->sync_mark.caret_known = true;
+      ui->sync_mark.caret_y0 = y0;
+      ui->sync_mark.caret_y1 = y1;
+    }
+  }
   SDL_SetRenderDrawColor(ui->sdl_renderer, 255, 80, 0, (Uint8)(230 * strength));
-  SDL_RenderFillRectF(ui->sdl_renderer, &caret);
+  txp_renderer_draw_caret(ctx, ui->doc_renderer, pt.x, y0, y1);
 }
 
 /* SyncTeX refinement by text.
@@ -2980,6 +2988,7 @@ static void show_position(fz_context *ctx, ui_state *ui, fz_point p)
   ui->sync_mark.pt = fz_make_point(p.x, p.y + 8);
   ui->sync_mark.box = fz_empty_rect;
   ui->sync_mark.no_caret = false;
+  ui->sync_mark.caret_known = false;
   ui->sync_mark.ticks = SDL_GetTicks();
 
   int w, h;
@@ -4691,6 +4700,7 @@ bool texpresso_main(struct persistent_state *ps)
         ui->sync_mark.pt = p;
         ui->sync_mark.box = mark_box;
         ui->sync_mark.no_caret = no_caret;
+        ui->sync_mark.caret_known = false;
         ui->sync_mark.ticks = SDL_GetTicks();
         schedule_event(RENDER_EVENT);
         fprintf(stderr, "[synctex forward] position on screen: (%.02f, %.02f)\n",
