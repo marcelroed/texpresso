@@ -156,6 +156,15 @@ typedef struct {
     int line, column;
   } sync_target;
 
+  // Position sent to the editor for the last click (backward sync). The
+  // editor moves its cursor there and requests a forward sync to it, which
+  // the caret of the click already shows.
+  struct {
+    char path[1024]; // relative to the document, empty if none
+    int line, column;
+    uint32_t ticks;
+  } sync_echo;
+
   // Links of the displayed page
   fz_link *links;
   int links_page;
@@ -174,6 +183,8 @@ typedef struct {
 #define SYNC_MARK_HOLD_MS 700
 #define SYNC_MARK_FADE_MS 900
 #define SYNC_MARK_FRAME_MS 25
+// Forward syncs to the position of a click within this delay are its echo
+#define SYNC_ECHO_MS 2000
 
 static bool sync_mark_active(ui_state *ui)
 {
@@ -2964,6 +2975,13 @@ static void sync_backward(struct persistent_state *ps, ui_state *ui, fz_point pt
 
   // The editor gets a 1-based column, 0 if unknown.
   editor_synctex(ps->doc_path, name, name_len, line, column >= 0 ? column + 1 : 0);
+
+  // It answers with the number of characters before its cursor.
+  snprintf(ui->sync_echo.path, sizeof(ui->sync_echo.path), "%s",
+           go_up == 0 ? rel : "");
+  ui->sync_echo.line = line;
+  ui->sync_echo.column = column >= 0 ? column : 0;
+  ui->sync_echo.ticks = SDL_GetTicks();
 }
 
 // Link of the displayed page under a screen position (in pixels)
@@ -4206,8 +4224,21 @@ static void interpret_command(struct persistent_state *ps,
                 "[command] synctex-forward %s: file has a different root, skipping\n",
                 path);
       }
+      else if (ui->sync_echo.path[0] &&
+               SDL_GetTicks() - ui->sync_echo.ticks < SYNC_ECHO_MS &&
+               strcmp(path, ui->sync_echo.path) == 0 &&
+               cmd.synctex_forward.line == ui->sync_echo.line &&
+               cmd.synctex_forward.column == ui->sync_echo.column)
+      {
+        fprintf(stderr, "[command] synctex-forward %s:%d:%d: position of the "
+                "last click, skipping\n",
+                path, cmd.synctex_forward.line, cmd.synctex_forward.column);
+      }
       else
       {
+        // The editor cursor moved: the caret of the last click is stale.
+        if (txp_renderer_clear_selection(ps->ctx, ui->doc_renderer))
+          schedule_event(RENDER_EVENT);
         synctex_set_target(stx, ui->page, path, cmd.synctex_forward.line,
                            cmd.synctex_forward.column);
         snprintf(ui->sync_target.path, sizeof(ui->sync_target.path), "%s", path);
@@ -4312,6 +4343,10 @@ bool texpresso_main(struct persistent_state *ps)
   ui->links_page = -1;
   ui->over_link = false;
   ui->history_len = 0;
+  ui->sync_mark.active = false;
+  ui->sync_target.path[0] = 0;
+  ui->sync_target.column = -1;
+  ui->sync_echo.path[0] = 0;
 
   bool using_texlive = 0;
 

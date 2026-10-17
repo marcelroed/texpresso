@@ -849,6 +849,13 @@ static float point_to_rect_dist(fz_point p, fz_rect r)
 //   return (p.x >= r.x0 && p.x <= r.x1) && (p.y >= r.y0 && p.y <= r.y1);
 // }
 
+bool txp_renderer_clear_selection(fz_context *ctx, txp_renderer *self)
+{
+  int has_sel = self->selection_count != 0;
+  self->selection_count = 0;
+  return has_sel;
+}
+
 bool txp_renderer_start_selection(fz_context *ctx, txp_renderer *self, fz_point pt)
 {
   int has_sel = self->selection_count != 0;

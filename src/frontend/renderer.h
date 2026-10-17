@@ -83,6 +83,8 @@ bool txp_renderer_page_position(fz_context *ctx, txp_renderer *self, SDL_FRect *
 
 void txp_renderer_render(fz_context *ctx, txp_renderer *self);
 void txp_renderer_set_scale_factor(fz_context *ctx, txp_renderer *self, fz_point scale);
+// Returns whether there was a selection
+bool txp_renderer_clear_selection(fz_context *ctx, txp_renderer *self);
 bool txp_renderer_start_selection(fz_context *ctx, txp_renderer *self, fz_point pt);
 bool txp_renderer_drag_selection(fz_context *ctx, txp_renderer *self, fz_point pt);
 bool txp_renderer_select_word(fz_context *ctx, txp_renderer *self, fz_point pt);
