@@ -140,6 +140,34 @@ static void answer_query(fz_context *ctx, struct tex_engine *self, query_t *q);
 
 // Launching processes
 
+// Engines launched by the driver and not yet reaped: a killed engine stays a
+// zombie until waited for. Snapshot forks are children of the engine, not of
+// the driver, so only launched pids are tracked.
+#define MAX_CHILDREN 64
+static pid_t children[MAX_CHILDREN];
+static int children_count = 0;
+
+static void reap_children(void)
+{
+  int j = 0;
+  for (int i = 0; i < children_count; i++)
+    if (waitpid(children[i], NULL, WNOHANG) == 0)
+      children[j++] = children[i];
+  children_count = j;
+}
+
+static void track_child(pid_t pid)
+{
+  reap_children();
+  if (children_count == MAX_CHILDREN)
+  {
+    // All still running: stop tracking the oldest rather than block on it.
+    memmove(children, children + 1, (MAX_CHILDREN - 1) * sizeof(pid_t));
+    children_count -= 1;
+  }
+  children[children_count++] = pid;
+}
+
 static pid_t exec_xelatex_generic(char **args, int *fd)
 {
   int sockets[2];
@@ -190,6 +218,7 @@ static pid_t exec_xelatex_generic(char **args, int *fd)
   // keeps the engine from seeing TeXpresso exit.
   fcntl(sockets[0], F_SETFD, FD_CLOEXEC);
   *fd = sockets[0];
+  track_child(pid);
   return pid;
 }
 
@@ -234,6 +263,7 @@ static void close_process(process_t *p)
     close(p->fd);
     p->fd = -1;
   }
+  reap_children();
 }
 
 static void pop_process(fz_context *ctx, struct tex_engine *self)
