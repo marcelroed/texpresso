@@ -69,6 +69,9 @@ struct txp_engine_class
   bool (*end_changes)(txp_engine *self, fz_context *ctx);
   int (*page_count)(txp_engine *self);
   fz_display_list *(*render_page)(txp_engine *self, fz_context *ctx, int page);
+  // A hash of the contents of a page: pages with the same hash render the
+  // same. 0 if unknown.
+  uint64_t (*page_hash)(txp_engine *self, int page);
   // Links of a page, in document space. Internal links have a target
   // understood by resolve_link.
   fz_link *(*load_links)(txp_engine *self, fz_context *ctx, int page);
@@ -93,6 +96,7 @@ struct txp_engine_class
   static void engine_destroy(txp_engine *_self, fz_context *ctx);           \
   static fz_display_list *engine_render_page(txp_engine *_self,             \
                                              fz_context *ctx, int page);    \
+  static uint64_t engine_page_hash(txp_engine *_self, int page);            \
   static bool engine_step(txp_engine *_self, fz_context *ctx,               \
                           bool restart_if_needed);                          \
   static void engine_begin_changes(txp_engine *_self, fz_context *ctx);     \
@@ -124,6 +128,7 @@ struct txp_engine_class
       .step = engine_step,                                                  \
       .page_count = engine_page_count,                                      \
       .render_page = engine_render_page,                                    \
+      .page_hash = engine_page_hash,                                        \
       .load_links = engine_load_links,                                      \
       .resolve_link = engine_resolve_link,                                  \
       .glyph_srcs = engine_glyph_srcs,                                      \

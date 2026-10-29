@@ -198,6 +198,24 @@ void incdvi_page_dim(incdvi_t *d, fz_buffer *buf, int page, float *width, float 
   }
 }
 
+uint64_t incdvi_page_hash(incdvi_t *d, fz_buffer *buf, int page)
+{
+  if (page < 0 || page >= incdvi_page_count(d))
+    return 0;
+  // FNV-1a of the page, leaving out the offset of the previous page (the
+  // last 4 bytes of the 45 of bop)
+  int bop = d->pages[page * 2];
+  int eop = d->pages[page * 2 + 1];
+  uint64_t h = 0xcbf29ce484222325;
+  for (int i = bop; i < eop; ++i)
+  {
+    if (i == bop + 41)
+      i = bop + 45;
+    h = (h ^ buf->data[i]) * 0x100000001b3;
+  }
+  return h ? h : 1;
+}
+
 void incdvi_render_page(fz_context *ctx, incdvi_t *d, fz_buffer *buf, int page, fz_device *dev)
 {
   if (page < 0 || page >= incdvi_page_count(d)) abort();

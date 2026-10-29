@@ -51,27 +51,45 @@ typedef struct
 
 #define SELECTION_RECT_COUNT 400
 
+// Space between the pages, in points
+#define PAGE_GAP 10
+
+// A page of the strip on screen
+typedef struct
+{
+  fz_display_list *contents;
+  fz_stext_page *stext;
+  int contents_bounds_valid;
+  fz_rect contents_bounds;
+  SDL_Texture *tex;
+  texture_state st;
+} page_slot;
+
 struct txp_renderer_s
 {
   SDL_Renderer *sdl;
   int output_w, output_h;
 
   fz_buffer *scratch;
-  fz_display_list *contents;
-  fz_stext_page *stext;
-  int contents_bounds_valid;
-  fz_rect contents_bounds;
+  // The previous, the current and the next page
+  page_slot slots[3];
   txp_renderer_config config;
 
-  SDL_Texture *tex;
-  texture_state st;
   fz_point selection_start;
   fz_rect selections[SELECTION_RECT_COUNT];
   int selection_count;
+  // Page of the selection, relative to the current one
+  int selection_slot;
   fz_point scale_factor;
 
   uint32_t cached_bg, cached_fg;
 };
+
+// The slot of the page at d (-1, 0 or 1) from the current one
+static page_slot *get_slot(txp_renderer *self, int d)
+{
+  return &self->slots[d + 1];
+}
 
 static void txp_get_colors(txp_renderer_config *config, uint32_t *bg, uint32_t *fg)
 {
@@ -118,12 +136,16 @@ txp_renderer *txp_renderer_new(fz_context *ctx, SDL_Renderer *sdl)
 
 void txp_renderer_free(fz_context *ctx, txp_renderer *self)
 {
-  if (self->contents)
-    fz_drop_display_list(ctx, self->contents);
-  if (self->stext)
-    fz_drop_stext_page(ctx, self->stext);
-  if (self->tex)
-    SDL_DestroyTexture(self->tex);
+  for (int i = 0; i < 3; ++i)
+  {
+    page_slot *s = &self->slots[i];
+    if (s->contents)
+      fz_drop_display_list(ctx, s->contents);
+    if (s->stext)
+      fz_drop_stext_page(ctx, s->stext);
+    if (s->tex)
+      SDL_DestroyTexture(s->tex);
+  }
   if (self->scratch)
     fz_drop_buffer(ctx, self->scratch);
   fz_free(ctx, self);
@@ -134,32 +156,49 @@ static void update_renderer_size(txp_renderer *self)
   SDL_GetRendererOutputSize(self->sdl, &self->output_w, &self->output_h);
 }
 
-static void clear_texture(txp_renderer *self)
+static void clear_texture(page_slot *s)
 {
-  self->st.x = 0;
-  self->st.y = 0;
-  self->st.rect = fz_make_irect(0, 0, 0, 0);
+  s->st.x = 0;
+  s->st.y = 0;
+  s->st.rect = fz_make_irect(0, 0, 0, 0);
+}
+
+static void slot_set_contents(fz_context *ctx, page_slot *s, fz_display_list *dl)
+{
+  fz_keep_display_list(ctx, dl);
+  if (s->contents)
+    fz_drop_display_list(ctx, s->contents);
+  if (s->stext)
+    fz_drop_stext_page(ctx, s->stext);
+  s->stext = NULL;
+  s->contents = dl;
+  clear_texture(s);
+  s->contents_bounds_valid = 0;
+}
+
+void txp_renderer_set_page(fz_context *ctx, txp_renderer *self, int d, fz_display_list *dl)
+{
+  page_slot *s = get_slot(self, d);
+  if (s->contents == dl)
+    return;
+  slot_set_contents(ctx, s, dl);
+  if (self->selection_slot == d)
+    self->selection_count = 0;
+}
+
+fz_display_list *txp_renderer_get_page(fz_context *ctx, txp_renderer *self, int d)
+{
+  return get_slot(self, d)->contents;
 }
 
 void txp_renderer_set_contents(fz_context *ctx, txp_renderer *self, fz_display_list *dl)
 {
-  if (self->contents == dl)
-    return;
-  fz_keep_display_list(ctx, dl);
-  if (self->contents)
-    fz_drop_display_list(ctx, self->contents);
-  if (self->stext)
-    fz_drop_stext_page(ctx, self->stext);
-  self->stext = NULL;
-  self->contents = dl;
-  clear_texture(self);
-  self->contents_bounds_valid = 0;
-  self->selection_count = 0;
+  txp_renderer_set_page(ctx, self, 0, dl);
 }
 
 fz_display_list *txp_renderer_get_contents(fz_context *ctx, txp_renderer *self)
 {
-  return self->contents;
+  return get_slot(self, 0)->contents;
 }
 
 txp_renderer_config *txp_renderer_get_config(fz_context *ctx, txp_renderer *self)
@@ -171,54 +210,59 @@ void txp_renderer_config_changed(fz_context *ctx, txp_renderer *self)
 {
 }
 
-static fz_rect get_bounds(fz_context *ctx, txp_renderer *self)
+static fz_rect get_bounds(fz_context *ctx, txp_renderer *self, page_slot *s)
 {
-  fz_rect bounds = fz_bound_display_list(ctx, self->contents);
+  fz_rect bounds = fz_bound_display_list(ctx, s->contents);
 
   if (!self->config.crop)
     return bounds;
 
-  if (!self->contents_bounds_valid)
+  if (!s->contents_bounds_valid)
   {
-    self->contents_bounds = fz_empty_rect;
-    fz_device * dev = fz_new_bbox_device(ctx, &self->contents_bounds);
-    fz_run_display_list(ctx, self->contents, dev, fz_identity, bounds, NULL);
+    s->contents_bounds = fz_empty_rect;
+    fz_device * dev = fz_new_bbox_device(ctx, &s->contents_bounds);
+    fz_run_display_list(ctx, s->contents, dev, fz_identity, bounds, NULL);
     fz_close_device(ctx, dev);
     fz_drop_device(ctx, dev);
-    self->contents_bounds = fz_intersect_rect(bounds, self->contents_bounds);
-    self->contents_bounds_valid = 1;
+    s->contents_bounds = fz_intersect_rect(bounds, s->contents_bounds);
+    s->contents_bounds_valid = 1;
   }
 
-  return self->contents_bounds;
+  return s->contents_bounds;
 }
 
+static fz_stext_page *slot_stext(fz_context *ctx, page_slot *s)
+{
+  if (s->stext == NULL)
+  {
+    if (s->contents == NULL)
+      return NULL;
+    fz_rect bounds = fz_bound_display_list(ctx, s->contents);
+    s->stext = fz_new_stext_page(ctx, bounds);
+    fz_device *dev = fz_new_stext_device(ctx, s->stext, NULL);
+    fz_run_display_list(ctx, s->contents, dev, fz_identity, bounds, NULL);
+    fz_close_device(ctx, dev);
+    fz_drop_device(ctx, dev);
+  }
+  return s->stext;
+}
+
+// Text of the current page
 static fz_stext_page *get_stext(fz_context *ctx, txp_renderer *self)
 {
-  if (self->stext == NULL)
-  {
-    if (self->contents == NULL)
-      return NULL;
-    fz_rect bounds = fz_bound_display_list(ctx, self->contents);
-    self->stext = fz_new_stext_page(ctx, bounds);
-    fz_device *dev = fz_new_stext_device(ctx, self->stext, NULL);
-    fz_run_display_list(ctx, self->contents, dev, fz_identity, bounds, NULL);
-    fz_close_device(ctx, dev);
-    fz_drop_device(ctx, dev);
-  }
-  return self->stext;
+  return slot_stext(ctx, get_slot(self, 0));
 }
 
-bool txp_renderer_page_bounds(fz_context *ctx, txp_renderer *self, txp_renderer_bounds *result)
+static bool slot_bounds(fz_context *ctx, txp_renderer *self, page_slot *s,
+                        txp_renderer_bounds *result)
 {
-  if (!self->contents)
+  if (!s->contents)
     return 0;
-
-  update_renderer_size(self);
 
   if (self->output_w <= 0 || self->output_h <= 0)
     return 0;
 
-  fz_rect bounds = get_bounds(ctx, self);
+  fz_rect bounds = get_bounds(ctx, self, s);
 
   float out_ar = (float)self->output_w / (float)self->output_h;
   float doc_ar = (bounds.x1 - bounds.x0) / (bounds.y1 - bounds.y0);
@@ -245,37 +289,219 @@ bool txp_renderer_page_bounds(fz_context *ctx, txp_renderer *self, txp_renderer_
   return 1;
 }
 
-bool txp_renderer_page_position(fz_context *ctx, txp_renderer *self, SDL_FRect *prect, fz_point *ptranslate, float *pscale)
+bool txp_renderer_page_bounds(fz_context *ctx, txp_renderer *self, txp_renderer_bounds *result)
 {
-  txp_renderer_bounds bounds;
-  if (!txp_renderer_page_bounds(ctx, self, &bounds))
+  if (!get_slot(self, 0)->contents)
     return 0;
 
-  float cx = bounds.pan_interval.x, cy = bounds.pan_interval.y;
+  update_renderer_size(self);
+  return slot_bounds(ctx, self, get_slot(self, 0), result);
+}
 
+/* Layout of the strip of pages */
+
+// Space between the pages, in pixels
+static float page_gap(txp_renderer *self)
+{
+  return PAGE_GAP * (self->scale_factor.y > 0 ? self->scale_factor.y : 1);
+}
+
+typedef struct
+{
+  // Pages of the slots, if they have contents
+  bool valid[3];
+  txp_renderer_bounds bounds[3];
+  // Top-left corner of the pages on screen, and their scale
+  fz_point pos[3];
+  float scale[3];
+  // Top of the current page on screen, without overscroll
+  float top;
+} strip_layout;
+
+// Range of the top of the current page on screen: the first page of the
+// strip does not go below the top of the window, nor the last one above
+// its bottom (pages shorter than the window go up to its middle instead)
+static void strip_range(txp_renderer *self, const strip_layout *l,
+                        float *tmin, float *tmax)
+{
+  float w = self->output_h, g = page_gap(self);
+  float h0 = l->bounds[0].document_size.y,
+        h1 = l->bounds[1].document_size.y,
+        h2 = l->bounds[2].document_size.y;
+
+  if (l->valid[0])
+    *tmax = fmaxf(0, (w - h0) / 2) + h0 + g;
+  else
+    *tmax = fmaxf(0, (w - h1) / 2);
+
+  if (l->valid[2])
+    *tmin = fminf(w, (w + h2) / 2) - h2 - g - h1;
+  else
+    *tmin = fminf(w, (w + h1) / 2) - h1;
+
+  // A strip shorter than the window is centered
+  if (*tmin > *tmax)
+    *tmin = *tmax = (*tmin + *tmax) / 2;
+}
+
+// Lay out the pages, clamping the pan to the strip. The vertical pan is
+// that of the current page alone (pan_interval), extended by the pages
+// around it.
+static bool strip_layout_compute(fz_context *ctx, txp_renderer *self, strip_layout *l)
+{
+  if (!get_slot(self, 0)->contents)
+    return 0;
+
+  update_renderer_size(self);
+  for (int i = 0; i < 3; ++i)
+    l->valid[i] = slot_bounds(ctx, self, &self->slots[i], &l->bounds[i]);
+  if (!l->valid[1])
+    return 0;
+
+  const txp_renderer_bounds *b = l->bounds;
+  float cx = b[1].pan_interval.x, cy = b[1].pan_interval.y;
   self->config.pan.x = clampf(self->config.pan.x, -cx, cx);
-  self->config.pan.y = clampf(self->config.pan.y, -cy, cy);
-  // fprintf(stderr, "after clamp: %.02f, %.02f\n", r->vp.pan.x, r->vp.pan.y);
 
-  // fprintf(stderr, "doc size: (%.02f, %.02f), out size: (%d, %d)\n",
-  //         doc_w, doc_h, self->output_w, self->output_h);
-  // fprintf(stderr, "out_ar: %.02f, doc_ar: %.02f, cx: %.02f, cy: %.02f\n",
-  //         out_ar, doc_ar, cx, cy);
+  float tmin, tmax;
+  strip_range(self, l, &tmin, &tmax);
+  float top = fz_clamp(self->config.pan.y - cy, tmin, tmax);
+  self->config.pan.y = top + cy;
+  l->top = top;
 
-  float scale = bounds.document_size.x / (bounds.page_bounds.x1 - bounds.page_bounds.x0);
-  float tx = self->config.pan.x - cx;
-  float ty = self->config.pan.y - cy + self->config.overscroll;
+  float g = page_gap(self);
+  float tops[3] = {top - g - b[0].document_size.y, top,
+                   top + b[1].document_size.y + g};
+  for (int i = 0; i < 3; ++i)
+  {
+    if (!l->valid[i])
+      continue;
+    // Pages wider than the window pan horizontally together
+    float px = b[i].pan_interval.x;
+    l->pos[i] = fz_make_point(clampf(self->config.pan.x, -px, px) - px,
+                              tops[i] + self->config.overscroll);
+    l->scale[i] = b[i].document_size.x / (b[i].page_bounds.x1 - b[i].page_bounds.x0);
+  }
+
+  return 1;
+}
+
+static void slot_position(const strip_layout *l, int i, SDL_FRect *prect,
+                          fz_point *ptranslate, float *pscale)
+{
+  const txp_renderer_bounds *b = &l->bounds[i];
+  float scale = l->scale[i];
+  float tx = l->pos[i].x, ty = l->pos[i].y;
 
   if (prect)
-    *prect = (SDL_FRect){.x = tx, .y = ty, .w = bounds.document_size.x, .h = bounds.document_size.y};
+    *prect = (SDL_FRect){.x = tx, .y = ty, .w = b->document_size.x, .h = b->document_size.y};
 
   if (ptranslate)
-    *ptranslate = fz_make_point(tx - bounds.page_bounds.x0 * scale, ty - bounds.page_bounds.y0 * scale);
+    *ptranslate = fz_make_point(tx - b->page_bounds.x0 * scale, ty - b->page_bounds.y0 * scale);
 
   if (pscale)
     *pscale = scale;
+}
 
+bool txp_renderer_page_position(fz_context *ctx, txp_renderer *self, SDL_FRect *prect, fz_point *ptranslate, float *pscale)
+{
+  strip_layout l;
+  if (!strip_layout_compute(ctx, self, &l))
+    return 0;
+  slot_position(&l, 1, prect, ptranslate, pscale);
   return 1;
+}
+
+bool txp_renderer_pan_range(fz_context *ctx, txp_renderer *self, float *min, float *max)
+{
+  strip_layout l;
+  if (!strip_layout_compute(ctx, self, &l))
+    return 0;
+  float tmin, tmax, cy = l.bounds[1].pan_interval.y;
+  strip_range(self, &l, &tmin, &tmax);
+  *min = tmin + cy;
+  *max = tmax + cy;
+  return 1;
+}
+
+int txp_renderer_middle_page(fz_context *ctx, txp_renderer *self)
+{
+  strip_layout l;
+  if (!strip_layout_compute(ctx, self, &l))
+    return 0;
+  // The gaps are split between the pages around them
+  float m = self->output_h / 2.0f, g = page_gap(self) / 2;
+  if (l.valid[0] && m < l.top - g)
+    return -1;
+  if (l.valid[2] && m > l.top + l.bounds[1].document_size.y + g)
+    return 1;
+  return 0;
+}
+
+static bool slot_visible(txp_renderer *self, const strip_layout *l, int i)
+{
+  SDL_FRect r;
+  if (!l->valid[i])
+    return 0;
+  slot_position(l, i, &r, NULL, NULL);
+  return r.x < self->output_w && r.x + r.w > 0 &&
+         r.y < self->output_h && r.y + r.h > 0;
+}
+
+bool txp_renderer_page_visible(fz_context *ctx, txp_renderer *self, int d)
+{
+  strip_layout l;
+  return strip_layout_compute(ctx, self, &l) && slot_visible(self, &l, d + 1);
+}
+
+int txp_renderer_page_at(fz_context *ctx, txp_renderer *self, fz_point pt)
+{
+  strip_layout l;
+  if (!strip_layout_compute(ctx, self, &l))
+    return 0;
+  for (int d = -1; d <= 1; d += 2)
+  {
+    SDL_FRect r;
+    if (!l.valid[d + 1])
+      continue;
+    slot_position(&l, d + 1, &r, NULL, NULL);
+    if (pt.x >= r.x && pt.x < r.x + r.w && pt.y >= r.y && pt.y < r.y + r.h)
+      return d;
+  }
+  return 0;
+}
+
+void txp_renderer_shift(fz_context *ctx, txp_renderer *self, int d, bool keep_view)
+{
+  strip_layout l;
+  bool known = keep_view && strip_layout_compute(ctx, self, &l) && l.valid[1 + d];
+  float top = known ? l.pos[1 + d].y - self->config.overscroll : 0;
+
+  // The slot of the page that leaves the strip takes the new one (keeping
+  // its texture)
+  page_slot out;
+  if (d > 0)
+  {
+    out = self->slots[0];
+    self->slots[0] = self->slots[1];
+    self->slots[1] = self->slots[2];
+    self->slots[2] = out;
+  }
+  else
+  {
+    out = self->slots[2];
+    self->slots[2] = self->slots[1];
+    self->slots[1] = self->slots[0];
+    self->slots[0] = out;
+  }
+  slot_set_contents(ctx, get_slot(self, d), NULL);
+
+  self->selection_slot -= d;
+  if (self->selection_slot < -1 || self->selection_slot > 1)
+    self->selection_count = 0;
+
+  txp_renderer_bounds b;
+  if (known && txp_renderer_page_bounds(ctx, self, &b))
+    self->config.pan.y = top + b.pan_interval.y;
 }
 
 static int ceil_pow2(int i)
@@ -286,26 +512,26 @@ static int ceil_pow2(int i)
   return r;
 }
 
-static void prepare_texture(fz_context *ctx, txp_renderer *self)
+static void prepare_texture(fz_context *ctx, txp_renderer *self, page_slot *s)
 {
   int pw = ceil_pow2(self->output_w), ph = ceil_pow2(self->output_h);
 
-  if (self->tex)
+  if (s->tex)
   {
     int tw, th;
-    SDL_QueryTexture(self->tex, NULL, NULL, &tw, &th);
+    SDL_QueryTexture(s->tex, NULL, NULL, &tw, &th);
     if (tw != pw || th != ph)
     {
-      SDL_DestroyTexture(self->tex);
-      self->tex = NULL;
+      SDL_DestroyTexture(s->tex);
+      s->tex = NULL;
     }
   }
 
-  if (!self->tex)
+  if (!s->tex)
   {
-    self->tex = SDL_CreateTexture(self->sdl, SDL_PIXELFORMAT_BGR24,
-                                  SDL_TEXTUREACCESS_STREAMING, pw, ph);
-    self->st = (texture_state){
+    s->tex = SDL_CreateTexture(self->sdl, SDL_PIXELFORMAT_BGR24,
+                               SDL_TEXTUREACCESS_STREAMING, pw, ph);
+    s->st = (texture_state){
         .w = pw,
         .h = ph,
         0,
@@ -351,7 +577,8 @@ static void invert_pixmap(fz_context *ctx, fz_pixmap *pix, uint32_t black, uint3
   }
 }
 
-static void render_rect(fz_context *ctx, txp_renderer *self, fz_rect bounds, void *pixels, int pitch,
+static void render_rect(fz_context *ctx, txp_renderer *self, page_slot *s,
+                        fz_rect bounds, void *pixels, int pitch,
                         int x, int y, fz_irect r, float scale)
 {
   fz_colorspace *csp = fz_device_bgr(ctx);
@@ -374,7 +601,7 @@ static void render_rect(fz_context *ctx, txp_renderer *self, fz_rect bounds, voi
   fz_point p1 = fz_transform_point_xy(bounds.x1, bounds.y1, ctm);
   fprintf(stderr, "optimized bounds: %f,%f - %f,%f\n", p0.x, p0.y, p1.x, p1.y);
 
-  fz_run_display_list(ctx, self->contents, dev, fz_identity, bounds, NULL);
+  fz_run_display_list(ctx, s->contents, dev, fz_identity, bounds, NULL);
   fz_close_device(ctx, dev);
   fz_drop_device(ctx, dev);
 
@@ -385,10 +612,11 @@ static void render_rect(fz_context *ctx, txp_renderer *self, fz_rect bounds, voi
   fz_drop_pixmap(ctx, pm);
 }
 
-static void render_inc_rect(fz_context *ctx, txp_renderer *self, fz_rect bounds, void *pixels,
-                        int x, int y, fz_irect n, fz_irect r, float scale)
+static void render_inc_rect(fz_context *ctx, txp_renderer *self, page_slot *s,
+                            fz_rect bounds, void *pixels,
+                            int x, int y, fz_irect n, fz_irect r, float scale)
 {
-  render_rect(ctx, self, bounds, pixels, 0, x + r.x0 - n.x0, y + r.y0 - n.y0, r, scale);
+  render_rect(ctx, self, s, bounds, pixels, 0, x + r.x0 - n.x0, y + r.y0 - n.y0, r, scale);
 }
 
 static void update_sdl_texture(SDL_Texture *t, int pitch, void *pixels,
@@ -548,6 +776,7 @@ static void render_texture_rect(SDL_Renderer *self, int rx, int ry, SDL_Texture 
 
 static void update_texture(fz_context *ctx,
                            txp_renderer *self,
+                           page_slot *s,
                            const SDL_FRect *page_rect,
                            const SDL_FRect *view_rect)
 {
@@ -557,40 +786,40 @@ static void update_texture(fz_context *ctx,
       .w = view_rect->w,
       .h = view_rect->h,
   };
-  prepare_texture(ctx, self);
+  prepare_texture(ctx, self, s);
 
   int x = tex_rect.x;
   int y = tex_rect.y;
   int w = tex_rect.w;
   int h = tex_rect.h;
 
-  fz_rect bounds = get_bounds(ctx, self);
+  fz_rect bounds = get_bounds(ctx, self, s);
   float doc_w = bounds.x1 - bounds.x0;
   float scale = (page_rect->w / doc_w);
 
   int done = 0;
 
-  if (scale != self->st.scale)
+  if (scale != s->st.scale)
   {
-    self->st.scale = scale;
+    s->st.scale = scale;
     // TODO: Full rerender
   }
-  else if (self->st.x != x ||
-           self->st.y != y ||
-           fz_irect_width(self->st.rect) != w ||
-           fz_irect_height(self->st.rect) != h)
+  else if (s->st.x != x ||
+           s->st.y != y ||
+           fz_irect_width(s->st.rect) != w ||
+           fz_irect_height(s->st.rect) != h)
   {
     // TODO: Incremental rerender
     // Find reusable area in texture
-    fz_irect o = self->st.rect;
+    fz_irect o = s->st.rect;
     fz_irect n;
-    n.x0 = o.x0 - self->st.x + x,
-    n.y0 = o.y0 - self->st.y + y,
+    n.x0 = o.x0 - s->st.x + x,
+    n.y0 = o.y0 - s->st.y + y,
     n.x1 = n.x0 + w;
     n.y1 = n.y0 + h;
-    self->st.x = x;
-    self->st.y = y;
-    self->st.rect = n;
+    s->st.x = x;
+    s->st.y = y;
+    s->st.rect = n;
 
     fz_irect overlap = fz_intersect_irect(o, n);
     if (fz_is_empty_irect(overlap))
@@ -621,36 +850,36 @@ static void update_texture(fz_context *ctx,
 
       if (!fz_is_empty_irect(tl))
       {
-        render_inc_rect(ctx, self, bounds, pixels, x, y, n, tl, scale);
+        render_inc_rect(ctx, self, s, bounds, pixels, x, y, n, tl, scale);
         fprintf(stderr, "render tl: %dus\n", stopclock_reset_us(&sc));
-        upload_texture_rect(self->tex, tl, pixels);
+        upload_texture_rect(s->tex, tl, pixels);
         fprintf(stderr, "upload tl: %dus\n", stopclock_reset_us(&sc));
         fprintf(stderr, "  tl: %d pixels\n", fz_irect_area(tl));
       }
 
       if (!fz_is_empty_irect(tr))
       {
-        render_inc_rect(ctx, self, bounds, pixels, x, y, n, tr, scale);
+        render_inc_rect(ctx, self, s, bounds, pixels, x, y, n, tr, scale);
         fprintf(stderr, "render tr: %dus\n", stopclock_reset_us(&sc));
-        upload_texture_rect(self->tex, tr, pixels);
+        upload_texture_rect(s->tex, tr, pixels);
         fprintf(stderr, "upload tr: %dus\n", stopclock_reset_us(&sc));
         fprintf(stderr, "  tr: %d pixels\n", fz_irect_area(tr));
       }
 
       if (!fz_is_empty_irect(bl))
       {
-        render_inc_rect(ctx, self, bounds, pixels, x, y, n, bl, scale);
+        render_inc_rect(ctx, self, s, bounds, pixels, x, y, n, bl, scale);
         fprintf(stderr, "render bl: %dus\n", stopclock_reset_us(&sc));
-        upload_texture_rect(self->tex, bl, pixels);
+        upload_texture_rect(s->tex, bl, pixels);
         fprintf(stderr, "upload bl: %dus\n", stopclock_reset_us(&sc));
         fprintf(stderr, "  bl: %d pixels\n", fz_irect_area(bl));
       }
 
       if (!fz_is_empty_irect(br))
       {
-        render_inc_rect(ctx, self, bounds, pixels, x, y, n, br, scale);
+        render_inc_rect(ctx, self, s, bounds, pixels, x, y, n, br, scale);
         fprintf(stderr, "render br: %dus\n", stopclock_reset_us(&sc));
-        upload_texture_rect(self->tex, br, pixels);
+        upload_texture_rect(s->tex, br, pixels);
         fprintf(stderr, "upload br: %dus\n", stopclock_reset_us(&sc));
         fprintf(stderr, "  br: %d pixels\n", fz_irect_area(br));
       }
@@ -682,36 +911,36 @@ static void update_texture(fz_context *ctx,
   else
   {
     SDL_Rect lock_rect = (SDL_Rect){.x = 0, .y = 0, .w = w, .h = h};
-    SDL_LockTexture(self->tex, &lock_rect, &pixels, &pitch);
+    SDL_LockTexture(s->tex, &lock_rect, &pixels, &pitch);
   }
 
   fz_irect full_rect = fz_make_irect(0, 0, w, h);
-  render_rect(ctx, self, bounds, pixels, pitch, x, y, full_rect, scale);
+  render_rect(ctx, self, s, bounds, pixels, pitch, x, y, full_rect, scale);
 
-  self->st.x = x;
-  self->st.y = y;
+  s->st.x = x;
+  s->st.y = y;
 
   int x0, y0;
   if (STRESS)
   {
-    x0 = (rand() % (self->st.w * 2)) - self->st.w;
-    y0 = (rand() % (self->st.h * 2)) - self->st.h;
+    x0 = (rand() % (s->st.w * 2)) - s->st.w;
+    y0 = (rand() % (s->st.h * 2)) - s->st.h;
   }
   else
   {
     x0 = 0;
     y0 = 0;
-    SDL_UnlockTexture(self->tex);
+    SDL_UnlockTexture(s->tex);
   }
 
-  self->st.rect.x0 = x0;
-  self->st.rect.y0 = y0;
-  self->st.rect.x1 = x0 + w;
-  self->st.rect.y1 = y0 + h;
+  s->st.rect.x0 = x0;
+  s->st.rect.y0 = y0;
+  s->st.rect.x1 = x0 + w;
+  s->st.rect.y1 = y0 + h;
 
   if (STRESS)
   {
-    upload_texture_rect(self->tex, self->st.rect, pixels);
+    upload_texture_rect(s->tex, s->st.rect, pixels);
   }
 
   // fprintf(stderr, "[txp_renderer] updated texture, new pixels: %d\n", w * h);
@@ -747,20 +976,37 @@ void txp_renderer_draw_caret(fz_context *ctx, txp_renderer *self, float x, float
   if (!txp_renderer_page_position(ctx, self, &page_rect, NULL, &scale))
     return;
   // Same rounding as the caret of the selection in txp_renderer_render
-  fz_rect bounds = get_bounds(ctx, self);
+  fz_rect bounds = get_bounds(ctx, self, get_slot(self, 0));
   render_caret(self, page_rect.x + (x - bounds.x0) * scale,
                page_rect.y + (y0 - bounds.y0) * scale, (y1 - y0) * scale);
 }
 
+// Draw the part of a page that is on screen
+static void render_slot(fz_context *ctx, txp_renderer *self, page_slot *s,
+                        const SDL_FRect *page_rect)
+{
+  const SDL_FRect screen_rect =
+      (SDL_FRect){.x = 0, .y = 0, .w = self->output_w, .h = self->output_h};
+
+  SDL_FRect view_rect;
+  view_rect.x = fmaxf(page_rect->x, screen_rect.x);
+  view_rect.y = fmaxf(page_rect->y, screen_rect.y);
+  view_rect.w = fminf(page_rect->x + page_rect->w, screen_rect.x + screen_rect.w) - view_rect.x;
+  view_rect.h = fminf(page_rect->y + page_rect->h, screen_rect.y + screen_rect.h) - view_rect.y;
+  if (view_rect.w <= 0 || view_rect.h <= 0)
+    return;
+
+  update_texture(ctx, self, s, page_rect, &view_rect);
+
+  int bx0 = floorf(view_rect.x);
+  int by0 = floorf(view_rect.y);
+  render_texture_rect(self->sdl, bx0, by0, s->tex, s->st.rect);
+}
 
 void txp_renderer_render(fz_context *ctx, txp_renderer *self)
 {
-  SDL_FRect page_rect;
-  float scale;
-
-  // fprintf(stderr, "[txp_renderer] txp_renderer_render: compute page pos\n");
-
-  if (!txp_renderer_page_position(ctx, self, &page_rect, NULL, &scale))
+  strip_layout l;
+  if (!strip_layout_compute(ctx, self, &l))
     return;
 
   uint32_t bg, fg;
@@ -769,49 +1015,27 @@ void txp_renderer_render(fz_context *ctx, txp_renderer *self)
   {
     self->cached_bg = bg;
     self->cached_fg = fg;
-    clear_texture(self);
+    for (int i = 0; i < 3; ++i)
+      clear_texture(&self->slots[i]);
   }
 
-  // fprintf(stderr, "[txp_renderer] page rect: {x=%.02f y=%.02f w=%.02f
-  // h=%.02f}\n",
-  //         page_rect.x, page_rect.y, page_rect.w, page_rect.h);
-
-  const SDL_FRect screen_rect =
-      (SDL_FRect){.x = 0, .y = 0, .w = self->output_w, .h = self->output_h};
-
-  // fprintf(stderr, "[txp_renderer] screen rect: {x=%.02f y=%.02f w=%.02f h=%.02f}\n",
-  //         screen_rect.x, screen_rect.y, screen_rect.w, screen_rect.h);
-
-  SDL_FRect view_rect;
-
-  // fprintf(stderr, "[txp_renderer] txp_renderer_render: intersect with screen\n");
-
-  view_rect.x = fmaxf(page_rect.x, screen_rect.x);
-  view_rect.y = fmaxf(page_rect.y, screen_rect.y);
-  view_rect.w = fminf(page_rect.x + page_rect.w, screen_rect.x + screen_rect.w) - view_rect.x;
-  view_rect.h = fminf(page_rect.y + page_rect.h, screen_rect.y + screen_rect.h) - view_rect.y;
-  if (view_rect.w <= 0 || view_rect.h <= 0)
-    return;
-
-  // fprintf(stderr, "[txp_renderer] txp_renderer_render: update texture\n");
-
-  struct timespec update_start, update_end;
-  clock_gettime(CLOCK_MONOTONIC, &update_start);
-  update_texture(ctx, self, &page_rect, &view_rect);
-  clock_gettime(CLOCK_MONOTONIC, &update_end);
-  // fprintf(stderr, "[txp_renderer] updated texture in %ldus\n",
-  //         (update_end.tv_sec - update_start.tv_sec) * 1000 * 1000 +
-  //         (update_end.tv_nsec - update_start.tv_nsec) / 1000);
-  // fprintf(stderr, "[txp_renderer] txp_renderer_render: blit texture to screen\n");
-
-  int bx0 = floorf(view_rect.x);
-  int by0 = floorf(view_rect.y);
-  int pixel_pushed = 0;
-  render_texture_rect(self->sdl, bx0, by0, self->tex, self->st.rect);
-  if (self->selection_count != 0)
+  for (int i = 0; i < 3; ++i)
   {
+    if (!l.valid[i])
+      continue;
+    SDL_FRect page_rect;
+    slot_position(&l, i, &page_rect, NULL, NULL);
+    render_slot(ctx, self, &self->slots[i], &page_rect);
+  }
+
+  int sel = self->selection_slot + 1;
+  if (self->selection_count != 0 && l.valid[sel])
+  {
+    SDL_FRect page_rect;
+    float scale;
+    slot_position(&l, sel, &page_rect, NULL, &scale);
     SDL_SetRenderDrawBlendMode(self->sdl, SDL_BLENDMODE_BLEND);
-    fz_rect bounds = get_bounds(ctx, self);
+    fz_rect bounds = get_bounds(ctx, self, &self->slots[sel]);
 
     for (int i = 0; i < self->selection_count; ++i)
     {
@@ -834,7 +1058,6 @@ void txp_renderer_render(fz_context *ctx, txp_renderer *self)
       }
     }
   }
-  // fprintf(stderr, "[render] pixels pushed to screen: %d\n", pixel_pushed);
 }
 
 static float point_to_rect_dist(fz_point p, fz_rect r)
@@ -860,13 +1083,14 @@ bool txp_renderer_start_selection(fz_context *ctx, txp_renderer *self, fz_point 
 {
   int has_sel = self->selection_count != 0;
   self->selection_count = 0;
+  self->selection_slot = 0;
 
   SDL_FRect page_rect;
   float scale;
   if (!txp_renderer_page_position(ctx, self, &page_rect, NULL, &scale))
     return has_sel;
 
-  fz_rect bounds = get_bounds(ctx, self);
+  fz_rect bounds = get_bounds(ctx, self, get_slot(self, 0));
   fz_point p = fz_make_point(bounds.x0 + (pt.x - page_rect.x) / scale,
                              bounds.y0 + (pt.y - page_rect.y) / scale);
   self->selection_start = p;
@@ -876,8 +1100,9 @@ bool txp_renderer_start_selection(fz_context *ctx, txp_renderer *self, fz_point 
 
 static int set_quads(fz_context *ctx, txp_renderer *self, fz_quad *quads, int count)
 {
-  int diff = count != self->selection_count;
+  int diff = count != self->selection_count || self->selection_slot != 0;
   self->selection_count = count;
+  self->selection_slot = 0;
 
   for (int i = 0; i < count; ++i)
   {

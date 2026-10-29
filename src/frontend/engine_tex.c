@@ -1200,6 +1200,14 @@ static fz_display_list *engine_render_page(txp_engine *_self, fz_context *ctx, i
   return dl;
 }
 
+static uint64_t engine_page_hash(txp_engine *_self, int page)
+{
+  SELF;
+  if (page < 0 || page >= incdvi_page_count(self->dvi))
+    return 0;
+  return incdvi_page_hash(self->dvi, self->st.document.entry->saved.data, page);
+}
+
 static fz_link *engine_load_links(txp_engine *_self, fz_context *ctx, int page)
 {
   SELF;

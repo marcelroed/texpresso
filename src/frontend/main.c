@@ -59,6 +59,26 @@ static void scroll_wakeup(void)
   schedule_event(SCROLL_EVENT);
 }
 
+/* Update timing (TXP_TIMING=1): when changes arrive, when the page count
+   changes and when new contents of a page reach the screen, on stderr
+   (lines "[timing] <ms> ..."; see test/update-timing.py). */
+static bool timing_enabled;
+
+static double timing_now(void)
+{
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
+
+static void timing_pages(int count)
+{
+  static int last = -1;
+  if (timing_enabled && count != last)
+    fprintf(stderr, "[timing] %.3f pages %d\n", timing_now(), count);
+  last = count;
+}
+
 #ifdef __APPLE__
 # define st_time(a) st_##a##timespec
 #else
@@ -115,6 +135,14 @@ typedef struct {
   int page;
   int need_synctex;
 
+  // Pages in the renderer before, at and after the current one (-1 for
+  // none), whether they were typeset again since they were loaded, and the
+  // hash of what was loaded (see page_hash). The middle one is the page on
+  // screen: it differs from page until that page is shown.
+  int slot_page[3];
+  bool slot_stale[3];
+  uint64_t slot_hash[3];
+
   // Mouse input state
   int last_mouse_x, last_mouse_y;
   uint32_t last_click_ticks;
@@ -149,6 +177,8 @@ typedef struct {
   } overscroll;
 
   uint32_t last_frame; // time of the last rendering
+  // Loads of the displayed page, and the one last on screen (for timing)
+  int contents_serial, presented_serial;
 
   // Last forward sync request (the path relative to the document).
   struct {
@@ -165,7 +195,7 @@ typedef struct {
     uint32_t ticks;
   } sync_echo;
 
-  // Links of the displayed page
+  // Links of the displayed page (loaded when needed)
   fz_link *links;
   int links_page;
   bool over_link;
@@ -2416,6 +2446,9 @@ static void render(fz_context *ctx, ui_state *ui)
   txp_renderer_render(ctx, ui->doc_renderer);
   render_sync_mark(ctx, ui);
   SDL_RenderPresent(ui->sdl_renderer);
+  if (timing_enabled && ui->presented_serial != ui->contents_serial)
+    fprintf(stderr, "[timing] %.3f present page %d\n", timing_now(), ui->page);
+  ui->presented_serial = ui->contents_serial;
 }
 
 struct repaint_on_resize_env
@@ -2438,6 +2471,43 @@ static int repaint_on_resize(void *data, SDL_Event *event)
 
 /* Document processing */
 
+// The output has `count` pages: those after are typeset again, and the
+// renderer has older versions of them
+static void note_page_count(ui_state *ui, int count)
+{
+  timing_pages(count);
+  for (int i = 0; i < 3; ++i)
+    if (ui->slot_page[i] >= count)
+      ui->slot_stale[i] = true;
+}
+
+// After changes to the document. Those that are not typeset change as a
+// whole.
+static void note_changes(ui_state *ui)
+{
+  bool typeset = send(get_status, ui->eng) == DOC_RUNNING;
+  note_page_count(ui, typeset ? send(page_count, ui->eng) : 0);
+}
+
+// The page at d (-1, 0 or 1) in the renderer was typeset again, the same:
+// it is up to date
+static bool slot_unchanged(ui_state *ui, int d)
+{
+  int i = 1 + d, page = ui->slot_page[i];
+  if (!ui->slot_stale[i] || page < 0 || page >= send(page_count, ui->eng) ||
+      ui->slot_hash[i] == 0 || send(page_hash, ui->eng, page) != ui->slot_hash[i])
+    return false;
+  ui->slot_stale[i] = false;
+  return true;
+}
+
+// The current page is on screen, up to date
+static bool current_page_shown(ui_state *ui)
+{
+  return ui->slot_page[1] == ui->page && !ui->slot_stale[1] &&
+         ui->presented_serial == ui->contents_serial;
+}
+
 static bool need_advance(fz_context *ctx, ui_state *ui)
 {
   if (send(get_status, ui->eng) != DOC_RUNNING)
@@ -2446,7 +2516,13 @@ static bool need_advance(fz_context *ctx, ui_state *ui)
   if (send(is_finishing, ui->eng))
     return true;
 
-  int need = send(page_count, ui->eng) <= ui->page;
+  int page_count = send(page_count, ui->eng);
+  int need = page_count <= ui->page;
+
+  // The next page is shown below the current one: typeset it too, once the
+  // current one is on screen (not to delay it)
+  if (!need && page_count <= ui->page + 1)
+    need = current_page_shown(ui);
 
   if (!need)
   {
@@ -2528,7 +2604,8 @@ static void mouse_position_in_points(int *x, int *y)
 
 /* Hyperlinks */
 
-static void display_page(struct persistent_state *ps, ui_state *ui);
+static void display_page(struct persistent_state *ps, ui_state *ui, bool keep_view);
+static void set_current_page(struct persistent_state *ps, ui_state *ui, int d);
 
 static const char *relative_path(const char *path, const char *dir, int *go_up);
 
@@ -2984,9 +3061,15 @@ static void sync_backward(struct persistent_state *ps, ui_state *ui, fz_point pt
   ui->sync_echo.ticks = SDL_GetTicks();
 }
 
+static void load_page_links(fz_context *ctx, ui_state *ui);
+
 // Link of the displayed page under a screen position (in pixels)
 static fz_link *link_at(fz_context *ctx, ui_state *ui, fz_point p)
 {
+  if (ui->slot_page[1] != ui->page)
+    return NULL;
+  if (ui->links_page != ui->page && ui->page < send(page_count, ui->eng))
+    load_page_links(ctx, ui);
   if (ui->links_page != ui->page)
     return NULL;
   fz_point pt = txp_renderer_screen_to_document(ctx, ui->doc_renderer, p);
@@ -3023,7 +3106,7 @@ static void go_to(struct persistent_state *ps, ui_state *ui, int page, fz_point 
   {
     synctex_set_target(send(synctex, ui->eng, NULL), 0, NULL, 0, -1);
     ui->page = page;
-    display_page(ps, ui);
+    display_page(ps, ui, false);
   }
   txp_renderer_get_config(ps->ctx, ui->doc_renderer)->pan = pan;
   schedule_event(RENDER_EVENT);
@@ -3112,6 +3195,10 @@ static void ui_mouse_down(struct persistent_state *ps, ui_state *ui, int x, int 
   fz_point link_pos = get_scale_factor(ui->window);
   link_pos.x *= x;
   link_pos.y *= y;
+  // A click on the previous or the next page is on the current one then
+  int d = txp_renderer_page_at(ps->ctx, ui->doc_renderer, link_pos);
+  if (d != 0 && ui->slot_page[1] == ui->page)
+    set_current_page(ps, ui, d);
   fz_link *link = ctrl ? NULL : link_at(ps->ctx, ui, link_pos);
   if (link)
   {
@@ -3236,8 +3323,8 @@ static void ui_wheel_pan_y(fz_context *ctx, ui_state *ui, float y,
   if (ui->overscroll.flipped || (momentum && ui->overscroll.bounced) || y == 0)
     return;
 
-  txp_renderer_bounds bounds;
-  if (!txp_renderer_page_bounds(ctx, ui->doc_renderer, &bounds))
+  float range_min, range_max;
+  if (!txp_renderer_pan_range(ctx, ui->doc_renderer, &range_min, &range_max))
   {
     config->pan.y += y;
     return;
@@ -3256,9 +3343,8 @@ static void ui_wheel_pan_y(fz_context *ctx, ui_state *ui, float y,
     t = 0;
   }
 
-  float range = fmaxf(bounds.pan_interval.y, 0);
-  float pan = fz_clamp(config->pan.y, -range, range);
-  float moved = fz_clamp(pan + y, -range, range);
+  float pan = fz_clamp(config->pan.y, range_min, range_max);
+  float moved = fz_clamp(pan + y, range_min, range_max);
   if (moved != pan)
     ui->overscroll.scrolled = true;
   config->pan.y = moved;
@@ -3568,22 +3654,23 @@ static void ui_pan(fz_context *ctx, ui_state *ui, float factor)
   txp_renderer_config *config = txp_renderer_get_config(ctx, ui->doc_renderer);
 
   txp_renderer_bounds bounds;
-  if (!txp_renderer_page_bounds(ctx, ui->doc_renderer, &bounds))
+  float range_min, range_max;
+  if (!txp_renderer_page_bounds(ctx, ui->doc_renderer, &bounds) ||
+      !txp_renderer_pan_range(ctx, ui->doc_renderer, &range_min, &range_max))
     return;
 
   float delta = bounds.window_size.y * scale.y * factor;
-  float range = bounds.pan_interval.y < 0 ? 0 : bounds.pan_interval.y;
 
-  //fprintf(stderr, "ui_pan: factor:%.02f delta:%.02f current:%.02f range:%.02f\n",
-  //        factor, delta, config->pan.y, range);
+  //fprintf(stderr, "ui_pan: factor:%.02f delta:%.02f current:%.02f range:%.02f-%.02f\n",
+  //        factor, delta, config->pan.y, range_min, range_max);
 
-  if (config->pan.y == -range && factor < 0)
+  if (config->pan.y == range_min && factor < 0)
   {
     next_page(ctx, ui, 1);
     return;
   }
 
-  if (config->pan.y == range && factor > 0)
+  if (config->pan.y == range_max && factor > 0)
   {
     previous_page(ctx, ui, 1);
     return;
@@ -3669,6 +3756,8 @@ static void realize_change(struct persistent_state *ps,
                            ui_state *ui,
                            struct editor_change *op)
 {
+  if (timing_enabled)
+    fprintf(stderr, "[timing] %.3f realize\n", timing_now());
   int go_up = 0;
   const char *path = relative_path(op->path, ps->doc_path, &go_up);
   if (go_up > 0)
@@ -3987,24 +4076,144 @@ static uint32_t convert_color(fz_context *ctx, vstack *stack, float frgb[3])
   return (rgb[0] << 16) | (rgb[1] << 8) | (rgb[2]);
 }
 
-static void display_page(struct persistent_state *ps, ui_state *ui)
+// Make the page at d (-1 or 1) in the renderer the one on screen
+static void shift_slots(fz_context *ctx, ui_state *ui, int d, bool keep_view)
 {
-  fz_display_list *dl = send(render_page, ui->eng, ps->ctx, ui->page);
-  txp_renderer_set_contents(ps->ctx, ui->doc_renderer, dl);
-  fz_drop_display_list(ps->ctx, dl);
+  txp_renderer_shift(ctx, ui->doc_renderer, d, keep_view);
+  int i = d > 0 ? 0 : 2;
+  for (int k = 0; k < 2; ++k, i += d)
+  {
+    ui->slot_page[i] = ui->slot_page[i + d];
+    ui->slot_stale[i] = ui->slot_stale[i + d];
+    ui->slot_hash[i] = ui->slot_hash[i + d];
+  }
+  ui->slot_page[i] = -1;
+  ui->slot_stale[i] = false;
+}
 
-  fz_drop_link(ps->ctx, ui->links);
+static void clear_neighbors(fz_context *ctx, ui_state *ui)
+{
+  for (int d = -1; d <= 1; d += 2)
+  {
+    txp_renderer_set_page(ctx, ui->doc_renderer, d, NULL);
+    ui->slot_page[1 + d] = -1;
+    ui->slot_stale[1 + d] = false;
+  }
+}
+
+// Load a page in the renderer, at d (-1, 0 or 1) from the current one
+static void load_slot(fz_context *ctx, ui_state *ui, int d, int page)
+{
+  fz_display_list *dl = send(render_page, ui->eng, ctx, page);
+  txp_renderer_set_page(ctx, ui->doc_renderer, d, dl);
+  fz_drop_display_list(ctx, dl);
+  ui->slot_page[1 + d] = page;
+  ui->slot_stale[1 + d] = false;
+  ui->slot_hash[1 + d] = send(page_hash, ui->eng, page);
+}
+
+static void load_page_links(fz_context *ctx, ui_state *ui)
+{
+  fz_drop_link(ctx, ui->links);
   ui->links = NULL;
   ui->links_page = ui->page;
-  fz_try(ps->ctx)
-    ui->links = send(load_links, ui->eng, ps->ctx, ui->page);
-  fz_catch(ps->ctx)
+  fz_try(ctx)
+    ui->links = send(load_links, ui->eng, ctx, ui->page);
+  fz_catch(ctx)
+    fprintf(stderr, "[link] cannot load links: %s\n", fz_caught_message(ctx));
+}
+
+// Show the current page as typeset now. If it is next to the one on
+// screen, the pages around move with it: with keep_view, they stay in place
+// (as when scrolling to it); otherwise it takes the place of the old one.
+static void display_page(struct persistent_state *ps, ui_state *ui, bool keep_view)
+{
+  int d = ui->page - ui->slot_page[1];
+  if (ui->slot_page[1] >= 0 && (d == 1 || d == -1))
   {
-    fprintf(stderr, "[link] cannot load links: %s\n", fz_caught_message(ps->ctx));
-    ui->links_page = -1;
+    load_slot(ps->ctx, ui, d, ui->page);
+    shift_slots(ps->ctx, ui, d, keep_view);
   }
+  else
+  {
+    if (d != 0)
+      clear_neighbors(ps->ctx, ui);
+    load_slot(ps->ctx, ui, 0, ui->page);
+  }
+  ui->contents_serial += 1;
+
+  load_page_links(ps->ctx, ui);
 
   schedule_event(RENDER_EVENT);
+}
+
+// Load the page at d (-1 or 1) from the current one, if it changed and is
+// typeset (meanwhile, the old version stays). Returns whether it did.
+static bool load_neighbor(struct persistent_state *ps, ui_state *ui, int d)
+{
+  int page = ui->page + d, i = 1 + d;
+  int page_count = send(page_count, ui->eng);
+  if (page < 0 ||
+      (page >= page_count && send(get_status, ui->eng) == DOC_TERMINATED))
+  {
+    // No such page
+    if (ui->slot_page[i] != -1)
+    {
+      if (txp_renderer_page_visible(ps->ctx, ui->doc_renderer, d))
+        schedule_event(RENDER_EVENT);
+      txp_renderer_set_page(ps->ctx, ui->doc_renderer, d, NULL);
+      ui->slot_page[i] = -1;
+      ui->slot_stale[i] = false;
+    }
+    return false;
+  }
+  if (page >= page_count ||
+      (ui->slot_page[i] == page && (!ui->slot_stale[i] || slot_unchanged(ui, d))))
+    return false;
+
+  load_slot(ps->ctx, ui, d, page);
+  if (timing_enabled)
+    fprintf(stderr, "[timing] %.3f neighbor page %d\n", timing_now(), page);
+  if (txp_renderer_page_visible(ps->ctx, ui->doc_renderer, d))
+    schedule_event(RENDER_EVENT);
+  return true;
+}
+
+// Load the pages around the current one, once it is on screen. Returns
+// whether there can be more to load.
+static bool load_neighbors(struct persistent_state *ps, ui_state *ui)
+{
+  if (!current_page_shown(ui))
+    return false;
+  // One at a time, to keep up with what comes in
+  return load_neighbor(ps, ui, -1) || load_neighbor(ps, ui, 1);
+}
+
+// Make the page at d (-1 or 1) the current one, where it is on screen
+static void set_current_page(struct persistent_state *ps, ui_state *ui, int d)
+{
+  synctex_set_target(send(synctex, ui->eng, NULL), 0, NULL, 0, -1);
+  ui->page += d;
+  shift_slots(ps->ctx, ui, d, true);
+  // Pages typeset again since they were loaded are loaded again when they
+  // are ready (see RELOAD_EVENT)
+  if (ui->slot_stale[1] && ui->page < send(page_count, ui->eng) &&
+      !slot_unchanged(ui, 0))
+    display_page(ps, ui, false);
+  // Scrolling goes on to the page after
+  load_neighbor(ps, ui, d);
+  schedule_event(RENDER_EVENT);
+}
+
+// After the user moved the view: the page in the middle of the window is
+// the current one
+static void follow_view(struct persistent_state *ps, ui_state *ui)
+{
+  if (ui->slot_page[1] != ui->page)
+    return;
+  int d = txp_renderer_middle_page(ps->ctx, ui->doc_renderer);
+  if (d != 0)
+    set_current_page(ps, ui, d);
 }
 
 #if !SDL_VERSION_ATLEAST(2, 0, 16)
@@ -4081,6 +4290,8 @@ static void interpret_command(struct persistent_state *ps,
       break;
 
     case EDIT_CHANGE:
+      if (timing_enabled)
+        fprintf(stderr, "[timing] %.3f change\n", timing_now());
       interpret_change(ps, ui, &cmd.change);
       break;
 
@@ -4164,7 +4375,7 @@ static void interpret_command(struct persistent_state *ps,
       if (page != ui->page)
       {
         ui->page = page;
-        display_page(ps, ui);
+        display_page(ps, ui, false);
       }
       // Replies go to stdout, the [test] markers to stderr: flush stdout
       // before each marker so that a reader sees the reply first.
@@ -4202,6 +4413,7 @@ static void interpret_command(struct persistent_state *ps,
                        OVERSCROLL_FRAME_MS);
       else
         ui_scroll(ps->ctx, ui, &ev);
+      follow_view(ps, ui);
       txp_renderer_config *config =
         txp_renderer_get_config(ps->ctx, ui->doc_renderer);
       fprintf(stderr, "[test] wheel: page %d pan %.2f tension %.2f velocity %.2f%s%s\n",
@@ -4339,10 +4551,18 @@ bool texpresso_main(struct persistent_state *ps)
   ui_state raw_ui, *ui = &raw_ui;
 
   ui->window = ps->window;
+  for (int i = 0; i < 3; ++i)
+  {
+    ui->slot_page[i] = -1;
+    ui->slot_stale[i] = false;
+    ui->slot_hash[i] = 0;
+  }
   ui->links = NULL;
   ui->links_page = -1;
   ui->over_link = false;
   ui->history_len = 0;
+  ui->contents_serial = ui->presented_serial = 0;
+  timing_enabled = getenv("TXP_TIMING") != NULL;
   ui->sync_mark.active = false;
   ui->sync_target.path[0] = 0;
   ui->sync_target.column = -1;
@@ -4417,6 +4637,12 @@ bool texpresso_main(struct persistent_state *ps)
     *txp_renderer_get_config(ps->ctx, ui->doc_renderer) = ps->initial.config;
     txp_renderer_set_contents(ps->ctx, ui->doc_renderer,
                               ps->initial.display_list);
+    // Shown until the page is typeset again
+    if (ps->initial.display_list)
+    {
+      ui->slot_page[1] = ui->page;
+      ui->slot_stale[1] = true;
+    }
     editor_reset_sync();
   }
   else
@@ -4516,6 +4742,7 @@ bool texpresso_main(struct persistent_state *ps)
 
     if (send(end_changes, ui->eng, ps->ctx))
     {
+      note_changes(ui);
       if (!ps->paused)
         send(step, ui->eng, ps->ctx, true);
       schedule_event(RELOAD_EVENT);
@@ -4525,9 +4752,11 @@ bool texpresso_main(struct persistent_state *ps)
     // Process document
     {
       int before_page_count = send(page_count, ui->eng);
+      note_page_count(ui, before_page_count);
       bool advance = !ps->paused && advance_engine(ps->ctx, ui);
       send(finish_convergence, ui->eng, ps->ctx);
       int after_page_count = send(page_count, ui->eng);
+      note_page_count(ui, after_page_count);
       fflush(stdout);
 
       if (ui->page >= before_page_count && ui->page < after_page_count)
@@ -4547,12 +4776,14 @@ bool texpresso_main(struct persistent_state *ps)
         continue;
       }
 
+      bool loading = load_neighbors(ps, ui);
+
       if (!has_event)
       {
         uint32_t frame_ms = animation_frame_ms(ui);
         uint32_t since = SDL_GetTicks() - ui->last_frame;
         bool animating = frame_ms != 0;
-        if (advance)
+        if (advance || loading)
         {
           // Keep animations going while the engine works (on a page that
           // was just turned to)
@@ -4610,7 +4841,7 @@ bool texpresso_main(struct persistent_state *ps)
             page >= 0 && page < send(page_count, ui->eng))
         {
           ui->page = page;
-          display_page(ps, ui);
+          display_page(ps, ui, true);
         }
 
         // FIXME: Scroll to point
@@ -4633,7 +4864,7 @@ bool texpresso_main(struct persistent_state *ps)
         if (by_glyph && weak && ui->page != glyph_page)
         {
           ui->page = glyph_page;
-          display_page(ps, ui);
+          display_page(ps, ui, true);
         }
         if (by_glyph && weak &&
             sync_refine_by_text(ps, ui, gp, fz_empty_rect, false, true, 0,
@@ -4653,7 +4884,7 @@ bool texpresso_main(struct persistent_state *ps)
           if (ui->page != page)
           {
             ui->page = page;
-            display_page(ps, ui);
+            display_page(ps, ui, true);
           }
           p = gp;
           // The line of text holding the glyph
@@ -4690,7 +4921,7 @@ bool texpresso_main(struct persistent_state *ps)
             if (other < 0 || other >= send(page_count, ui->eng))
               continue;
             ui->page = other;
-            display_page(ps, ui);
+            display_page(ps, ui, true);
             fz_point start = d > 0 ? fz_make_point(0, 0)
                                    : fz_make_point(INFINITY, INFINITY);
             fz_point op;
@@ -4710,7 +4941,7 @@ bool texpresso_main(struct persistent_state *ps)
           if (ui->page != page)
           {
             ui->page = page;
-            display_page(ps, ui);
+            display_page(ps, ui, true);
           }
           if (refined)
           {
@@ -4766,7 +4997,9 @@ bool texpresso_main(struct persistent_state *ps)
     txp_renderer_config *config =
         txp_renderer_get_config(ps->ctx, ui->doc_renderer);
 
-    // Process event
+    // Process event. After those that move the view, the page in the
+    // middle of the window becomes the current one.
+    bool view_moved = false;
     switch (e.type)
     {
       case SDL_QUIT:
@@ -4774,6 +5007,7 @@ bool texpresso_main(struct persistent_state *ps)
         break;
 
       case SDL_KEYDOWN:
+        view_moved = true;
         switch (e.key.keysym.sym)
         {
           case SDLK_LEFT:
@@ -4941,6 +5175,7 @@ bool texpresso_main(struct persistent_state *ps)
           bool ctrl = !!(SDL_GetModState() & KMOD_CTRL);
           ui_mouse_wheel(ps->ctx, ui, px, py, mx, my, ctrl, TXP_SCROLL_WHEEL,
                          OVERSCROLL_FRAME_MS);
+          view_moved = true;
         }
         break;
 
@@ -4951,6 +5186,7 @@ bool texpresso_main(struct persistent_state *ps)
         int mx = 0, my = 0;
         mouse_position_in_points(&mx, &my);
         ui_pinch(ps->ctx, ui, factor, mx, my);
+        view_moved = true;
         break;
       }
 
@@ -4970,6 +5206,7 @@ bool texpresso_main(struct persistent_state *ps)
       {
         int mx, my;
         mouse_position_in_points(&mx, &my);
+        view_moved = ui->mouse_status == UI_MOUSE_MOVE;
         ui_mouse_move(ps->ctx, ui, mx, my);
         break;
       }
@@ -4979,6 +5216,8 @@ bool texpresso_main(struct persistent_state *ps)
         {
           case SDL_WINDOWEVENT_SIZE_CHANGED:
           case SDL_WINDOWEVENT_RESIZED:
+            view_moved = true;
+            // fallthrough
           case SDL_WINDOWEVENT_EXPOSED:
             sync_fullscreen_state(&fs, config, ui->window);
             schedule_event(RENDER_EVENT);
@@ -5004,6 +5243,7 @@ bool texpresso_main(struct persistent_state *ps)
           send(detect_changes, ui->eng, ps->ctx);
           if (send(end_changes, ui->eng, ps->ctx))
           {
+            note_changes(ui);
             if (!ps->paused)
               send(step, ui->eng, ps->ctx, true);
             schedule_event(RELOAD_EVENT);
@@ -5016,6 +5256,7 @@ bool texpresso_main(struct persistent_state *ps)
           flush_changes(ps, ui);
           if (send(end_changes, ui->eng, ps->ctx))
           {
+            note_changes(ui);
             if (!ps->paused)
               send(step, ui->eng, ps->ctx, true);
             schedule_event(RELOAD_EVENT);
@@ -5034,8 +5275,11 @@ bool texpresso_main(struct persistent_state *ps)
               pan_to(ps->ctx, ui, PAN_TO_BOTTOM);
             }
           }
-          if (ui->page < page_count)
-            display_page(ps, ui);
+          // (unless it was not typeset again, or the same)
+          if (ui->page < page_count &&
+              !(ui->slot_page[1] == ui->page &&
+                (!ui->slot_stale[1] || slot_unchanged(ui, 0))))
+            display_page(ps, ui, false);
           break;
 
         case STDIN_EVENT:
@@ -5045,11 +5289,16 @@ bool texpresso_main(struct persistent_state *ps)
         {
           txp_scroll_event ev;
           while (txp_scroll_next(&ev))
+          {
             ui_scroll(ps->ctx, ui, &ev);
+            follow_view(ps, ui);
+          }
           break;
         }
       }
     }
+    if (view_moved)
+      follow_view(ps, ui);
     if (ps->initialize_only &&
         (send(page_count, ui->eng) > 0 ||
          (send(get_status, ui->eng) == DOC_TERMINATED && stdin_eof)))

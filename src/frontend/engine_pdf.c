@@ -59,6 +59,11 @@ static fz_display_list *engine_render_page(txp_engine *_self,
   return dl;
 }
 
+static uint64_t engine_page_hash(txp_engine *_self, int page)
+{
+  return 0;
+}
+
 static fz_link *engine_load_links(txp_engine *_self, fz_context *ctx, int index)
 {
   SELF;
