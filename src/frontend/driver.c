@@ -326,11 +326,19 @@ int main(int argc, const char **argv)
 
   SDL_Surface *logo = texpresso_logo();
   fprintf(stderr, "texpresso logo: %dx%d\n", logo->w, logo->h);
-#ifndef __APPLE__
-  // SDL_SetWindowIcon on macOS calls [NSApp setApplicationIconImage:]
-  // which scales the image to fill the Dock cell, ignoring transparent
-  // padding. On macOS we rely on the .app bundle's AppIcon.icns instead
-  // (see scripts/build-macos-app.sh).
+#ifdef __APPLE__
+  // SDL_SetWindowIcon on macOS sets the Dock icon. The .app bundle
+  // (scripts/build-macos-app.sh) has its own AppIcon.icns, but editors
+  // usually launch the bare binary, which would otherwise get the generic
+  // executable icon. The logo is doc/texpresso_logo_v3.svg with the
+  // margins of a macOS icon (artwork in the middle 80%), so it should
+  // look the same as the bundle icon.
+  char *base = SDL_GetBasePath();
+  int bundled = base && strstr(base, ".app/Contents/") != NULL;
+  SDL_free(base);
+  if (!bundled)
+    SDL_SetWindowIcon(window, logo);
+#else
   SDL_SetWindowIcon(window, logo);
 #endif
   SDL_FreeSurface(logo);
